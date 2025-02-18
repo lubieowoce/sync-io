@@ -1,15 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { createChannel } from "./utils.mjs";
 
-function promiseWithResolvers() {
-  let resolve, reject;
-  const promise = new Promise((_resolve, _reject) => {
-    resolve = _resolve;
-    reject = _reject;
-  });
-  return { promise, resolve, reject };
-}
-
 (async () => {
   console.log("root :: hello");
 

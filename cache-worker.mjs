@@ -7,24 +7,9 @@ if (!workerDataRaw) {
 }
 console.log("cache-worker :: hello");
 
-// require("./native/sync-io.node");
-
 /** @type {{ comm: import("./utils.mjs").ChannelEnd }} */
 const workerData = workerDataRaw;
 const { comm } = workerData;
-
-// let i = 0;
-// let last = Date.now();
-// setInterval(() => {
-//   const now = Date.now();
-//   console.log(
-//     "cache-worker :: interval",
-//     i++,
-//     (now - last).toFixed(1),
-//     new Date().toISOString()
-//   );
-//   last = now;
-// }, 100);
 
 listenForRequests(comm, async (request) => {
   console.log("cache-worker :: got request", request);
