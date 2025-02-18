@@ -1,12 +1,11 @@
 // @ts-check
 import { listenForRequests } from "./utils.mjs";
-import { parentPort, workerData as workerDataRaw } from "node:worker_threads";
+import { workerData as workerDataRaw } from "node:worker_threads";
 
-if (!parentPort) {
+if (!workerDataRaw) {
   throw new Error("Expected to run within a Worker");
 }
 console.log("cache-worker :: hello");
-parentPort.postMessage("UP");
 
 // require("./native/sync-io.node");
 

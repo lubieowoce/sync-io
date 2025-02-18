@@ -13,27 +13,16 @@ function promiseWithResolvers() {
 (async () => {
   console.log("root :: hello");
 
-  const waitForBoot = async (worker) => {
-    await new Promise((resolve) =>
-      worker.on("message", function handler(value) {
-        if (value === "UP") {
-          resolve();
-          worker.off("message", handler);
-        }
-      })
-    );
+  const waitForBoot = async (
+    /** @type {import("node:worker_threads").Worker} */ worker
+  ) => {
+    await new Promise((resolve) => worker.on("online", () => resolve()));
   };
 
-  const waitForEnd = async (worker) => {
-    await new Promise(
-      (resolve) => worker.on("exit", () => resolve())
-      // worker.on("message", function handler(value) {
-      //   if (value === "DONE") {
-      //     resolve();
-      //     worker.off("message", handler);
-      //   }
-      // })
-    );
+  const waitForEnd = async (
+    /** @type {import("node:worker_threads").Worker} */ worker
+  ) => {
+    await new Promise((resolve) => worker.on("exit", () => resolve()));
   };
 
   const { client, server } = createChannel();
