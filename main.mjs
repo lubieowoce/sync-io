@@ -2,22 +2,20 @@
 import { Worker } from "node:worker_threads";
 import { createChannel } from "./utils.mjs";
 
+const waitForBoot = async (
+  /** @type {import("node:worker_threads").Worker} */ worker
+) => {
+  await new Promise((resolve) => worker.on("online", () => resolve(undefined)));
+};
+
+const waitForEnd = async (
+  /** @type {import("node:worker_threads").Worker} */ worker
+) => {
+  await new Promise((resolve) => worker.on("exit", () => resolve(undefined)));
+};
+
 (async () => {
   console.log("root :: hello");
-
-  const waitForBoot = async (
-    /** @type {import("node:worker_threads").Worker} */ worker
-  ) => {
-    await new Promise((resolve) =>
-      worker.on("online", () => resolve(undefined))
-    );
-  };
-
-  const waitForEnd = async (
-    /** @type {import("node:worker_threads").Worker} */ worker
-  ) => {
-    await new Promise((resolve) => worker.on("exit", () => resolve(undefined)));
-  };
 
   const { client, server } = createChannel();
 
