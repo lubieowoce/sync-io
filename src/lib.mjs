@@ -415,11 +415,10 @@ async function raceBatchStartImpl(/** @type {Batch} */ batch) {
       // (and it's pointless for us to create more microtasks here)
       return;
     }
-
-    // if we got here, we waited for `BATCH_MICRO_WAIT_ITERATIONS` and we're still the last item,
-    // so we consider the batch closed and can kick off the request.
-    batch.start.resolve();
   }
+  // if we got here, we waited for `BATCH_MICRO_WAIT_ITERATIONS` and we're still the last item,
+  // so we consider the batch closed and can kick off the request.
+  batch.start.resolve();
 }
 
 //===============================================
