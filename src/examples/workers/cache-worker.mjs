@@ -27,6 +27,9 @@ const functions = {
     const result = await response.json();
     return result;
   },
+  async unserializableResponse() {
+    return { promise: Promise.resolve("oops") };
+  },
 };
 
 /** @typedef {{ functionId: string, args: any[] }} CachedFunctionCall */

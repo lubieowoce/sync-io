@@ -20,6 +20,7 @@ if (!workerDataRaw) {
 
   const loremIpsum = createProxy(comm, "loremIpsum");
   const getPost = createProxy(comm, "getPost");
+  const unserializableResponse = createProxy(comm, "unserializableResponse");
 
   let timeoutRan = false;
   setTimeout(() => {
@@ -30,13 +31,16 @@ if (!workerDataRaw) {
   await (console.log(`render-worker ${id} :: loremIpsum("boop")`),
   loremIpsum("boop"));
 
-  const responses = await Promise.all([
-    (console.log(`render-worker ${id} :: getPost(3)`), getPost(3)),
-    (console.log(`render-worker ${id} :: getPost(4)`), getPost(4)),
-  ]);
-
   {
     console.log(`render-worker ${id} :: sending parallel requests`);
+    const responses = await Promise.all([
+      (console.log(`render-worker ${id} :: getPost(3)`),
+      getPost(3).catch((err) => err)),
+      (console.log(`render-worker ${id} :: getPost(4)`),
+      getPost(4).catch((err) => err)),
+      (console.log(`render-worker ${id} :: unserializableResponse()`),
+      unserializableResponse().catch((err) => err)),
+    ]);
     console.log(`render-worker ${id} :: got responses`, responses, {
       timeoutRan,
     });

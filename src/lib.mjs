@@ -377,7 +377,23 @@ export function listenForRequests(
     debug?.("server :: sending response:", results);
     /** @type {InternalResponsePayload} */
     const responsePayload = { id, data: results };
-    sourcePort.postMessage(responsePayload);
+    try {
+      sourcePort.postMessage(responsePayload);
+    } catch (err) {
+      if (isDataCloneError(err)) {
+        // We tried to respond with something uncloneable.
+        // find out which results caused this and error them.
+        /** @type {InternalResponsePayload} */
+        const fallbackResponsePayload = {
+          id,
+          data: replaceUncloneableResultsWithError(results),
+        };
+        sourcePort.postMessage(fallbackResponsePayload);
+      } else {
+        // nothing more we can do here
+        throw err;
+      }
+    }
 
     const asArray = new Int32Array(comm.buffer);
     Atomics.store(asArray, sourceIndex, ARR_VALUE_STATE.DONE);
@@ -404,9 +420,36 @@ export function listenForRequests(
   };
 }
 
+/** @returns {InternalResponsePayload['data']} */
+function replaceUncloneableResultsWithError(
+  /** @type {InternalResponsePayload['data']} */ results
+) {
+  return results.map((result) => {
+    try {
+      structuredClone(
+        result.status === "fulfilled" ? result.value : result.reason
+      );
+    } catch (err) {
+      return { status: "rejected", reason: serializeThrown(err) };
+    }
+    return result;
+  });
+}
+
+/** @returns {err is DOMException} */
+function isDataCloneError(/** @type {unknown} */ err) {
+  return !!(
+    err &&
+    typeof err === "object" &&
+    err instanceof DOMException &&
+    err.name === "DataCloneError"
+  );
+}
+
 function serializeThrown(/** @type {unknown} */ error) {
   if (error && typeof error === "object" && error instanceof Error) {
     return {
+      name: error.name,
       message: error.message,
       stack: error.stack,
       // TODO: cause
@@ -421,6 +464,7 @@ function deserializeThrown(
 ) {
   if (typeof serialized === "object") {
     const error = new Error(serialized.message);
+    error.name = serialized.name;
     if (serialized.stack) {
       error.stack = serialized.stack;
     }
