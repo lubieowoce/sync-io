@@ -26,6 +26,11 @@ const waitForEnd = async (
       transferList: [...client.transferList],
     }
   );
+  mainWorker.on("error", (err) => {
+    console.error("Unhandled error in main worker:", err);
+    process.exit(1);
+  });
+
   const cacheWorker = new Worker(
     new URL(import.meta.resolve("./cache-worker.mjs")),
     {
@@ -33,6 +38,10 @@ const waitForEnd = async (
       transferList: [...server.transferList],
     }
   );
+  cacheWorker.on("error", (err) => {
+    console.error("Unhandled error in cache worker:", err);
+    process.exit(1);
+  });
 
   await Promise.all([waitForBoot(mainWorker), waitForBoot(cacheWorker)]);
   await waitForEnd(mainWorker);

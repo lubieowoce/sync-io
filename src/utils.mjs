@@ -11,7 +11,7 @@ const ARR_VALUE_STATE = {
   DONE: 1,
 };
 
-/** @returns {{ client: ChannelEnd, server: ChannelEnd }} */
+/** @returns {{ client: ChannelClient, server: ChannelServer }} */
 export function createChannel() {
   const buffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const asArray = new Int32Array(buffer);
@@ -19,30 +19,92 @@ export function createChannel() {
 
   const channel = new MessageChannel();
 
-  /**
-   * @returns {ChannelEnd}
-   * @param {import("node:worker_threads").MessagePort} messagePort
-   * @param {SharedArrayBuffer} buffer
-   */
-  function createChannelEnd(messagePort, buffer) {
-    return { messagePort, buffer, transferList: [messagePort] };
-  }
-
   return {
-    client: createChannelEnd(channel.port1, buffer),
-    server: createChannelEnd(channel.port2, buffer),
+    client: {
+      messagePort: channel.port1,
+      buffer,
+      transferList: [channel.port1],
+      batch: createBatch(),
+    },
+    server: {
+      messagePort: channel.port2,
+      buffer,
+      transferList: [channel.port2],
+    },
   };
 }
 
-/** @typedef {{ messagePort: import("node:worker_threads").MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEnd */
+/** @returns {Batch} */
+function createBatch() {
+  return { items: [], start: undefined };
+}
+
+/**
+ * @template T
+ * @typedef {ReturnType<typeof promiseWithResolvers<T>>} PromiseWithResolvers<T>
+ */
+
+/**
+ * @template TIn
+ * @template TOut
+ * @typedef {{ data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: Omit<PromiseWithResolvers<TOut>, 'promise'> }} BatchItem<TIn, TOut>
+ */
+
+/** @typedef {{ items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> | undefined }} Batch */
+
+/** @typedef {{ messagePort: import("node:worker_threads").MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
+/** @typedef {ChannelEndBase} ChannelServer */
+/** @typedef {ChannelEndBase & { batch: Batch }} ChannelClient */
+
+/** @typedef {{ id: number, data: unknown[] }} InternalRequestPayload */
+/** @typedef {{ id: number, data: Settled<unknown, ReturnType<typeof serializeThrown>>[] }} InternalResponsePayload */
+
+/**
+ * @template T, E
+ * @typedef {{ status: 'fulfilled', value: T } | { status: 'rejected', reason: E }} Settled<T, E>
+ * */
 
 const USE_SYNC_MESSAGE_RECEIVE = true;
 
 export function sendRequest(
-  /** @type {ChannelEnd} */ comm,
+  /** @type {ChannelClient} */ comm,
   /** @type {any} */ data,
   /** @type {import("node:worker_threads").TransferListItem[]} */ transfer = []
 ) {
+  // `Batch.start` is not cloneable/transferable so it starts out as undefined
+  // TODO: the stuff we return from `createChannel` really doesn't need to have all the internal state, just the buffer + port.
+  // we should have some kind of init function inside the worker to avoid tricks like this
+  if (!comm.batch.start) {
+    comm.batch.start = promiseWithResolvers();
+  }
+
+  const waitUntilBatchEnd = () => Promise.resolve();
+
+  const raceBatchStart = () => {
+    const batchLength = comm.batch.items.length;
+    waitUntilBatchEnd().then(() => {
+      // if the batch length didn't change, i.e.g nothing got added after us,
+      // then we're chronologically the last item and our `waitUntilBatchEnd` finished last,
+      // so we have to kick off the batch request.
+      if (comm.batch.items.length === batchLength) {
+        nullThrows(comm.batch.start).resolve();
+      }
+    });
+  };
+
+  // if a batch is ongoing, item 0 will handle sending it and resolving the promise,
+  // we just need to register ourselves and bump the start timer.
+  if (comm.batch.items.length > 0) {
+    const controller = promiseWithResolvers();
+    comm.batch.items.push({
+      data,
+      transfer,
+      controller,
+    });
+    raceBatchStart();
+    return controller.promise;
+  }
+
   return new Promise(async (resolve, reject) => {
     const id = crypto.randomInt(0, Math.pow(2, 48) - 1);
 
@@ -53,45 +115,91 @@ export function sendRequest(
 
     function handleResponse(/** @type {Event} */ rawEvent) {
       const event = /** @type {MessageEvent} */ (rawEvent);
-      const { id: incomingId, data: response } = JSON.parse(event.data);
+      /** @type {InternalResponsePayload} */
+      const { id: incomingId, data: batchResponse } = JSON.parse(event.data);
       if (incomingId !== id) {
         return;
+      }
+
+      if (!Array.isArray(batchResponse)) {
+        return rejectBatch(new Error("Invariant: Response is not an array"));
+      }
+      if (batchResponse.length !== requestedBatchItems.length) {
+        return rejectBatch(
+          new Error(
+            `Invariant: Expected response to have length ${requestedBatchItems.length}, got ${batchResponse.length}`
+          )
+        );
       }
 
       if (!USE_SYNC_MESSAGE_RECEIVE) {
         comm.messagePort.removeEventListener("message", handleResponse);
         if (timeoutRan) {
-          reject(
+          return rejectBatch(
             new Error(
               "Invariant: Did not receive a response message in under a task"
             )
           );
-          return;
         } else {
           clearTimeout(timeout);
         }
       }
 
-      return resolve(response);
+      for (let i = 0; i < requestedBatchItems.length; i++) {
+        const result = batchResponse[i];
+        if (result.status === "fulfilled") {
+          requestedBatchItems[i].controller.resolve(result.value);
+        } else {
+          requestedBatchItems[i].controller.reject(
+            deserializeThrown(result.reason)
+          );
+        }
+      }
     }
 
     if (!USE_SYNC_MESSAGE_RECEIVE) {
       comm.messagePort.addEventListener("message", handleResponse);
     }
 
-    comm.messagePort.postMessage({ id, data }, transfer);
+    comm.batch.items.push({ data, transfer, controller: { resolve, reject } });
+    raceBatchStart();
+    await nullThrows(comm.batch.start).promise;
 
-    // TODO: do we need this? does this help?
-    // it lets us run in parallel (because we don't block immediately when creating the promise)
-    // but right now the comm channel doesn't allow multiple requests
-    // await Promise.resolve();
+    // we're item 0, so we send the batch
+    const requestedBatchItems = comm.batch.items;
+    comm.batch = createBatch();
 
+    {
+      /** @type {InternalRequestPayload} */
+      const requestPayload = {
+        id,
+        data: requestedBatchItems.map((item) => item.data),
+      };
+      const requestTransferList = requestedBatchItems.flatMap(
+        (item) => item.transfer
+      );
+      debug?.("client :: sending batch", requestPayload, requestTransferList);
+
+      // TODO: handle messageerror here?
+      comm.messagePort.postMessage(requestPayload, requestTransferList);
+    }
+
+    const rejectBatch = (/** @type {Error} */ err) => {
+      debug?.("client :: rejecting batch", err);
+      for (let i = 0; i < requestedBatchItems.length; i++) {
+        requestedBatchItems[i].controller.reject(err);
+      }
+    };
+
+    // block event loop while we wait
     const asArray = new Int32Array(comm.buffer);
     debug?.("client :: calling Atomics.wait");
     const waitRes = Atomics.wait(asArray, ARR_INDEX, ARR_VALUE_STATE.NOT_DONE);
     if (waitRes === "not-equal") {
-      throw new Error(
-        "Invariant: expected to be in NOT_DONE state when calling Atomics.wait"
+      return rejectBatch(
+        new Error(
+          "Invariant: expected to be in NOT_DONE state when calling Atomics.wait"
+        )
       );
     }
     debug?.("client :: Atomics.wait returned", waitRes);
@@ -99,8 +207,8 @@ export function sendRequest(
     if (USE_SYNC_MESSAGE_RECEIVE) {
       const msg = receiveMessageOnPort(comm.messagePort);
       if (!msg) {
-        throw new Error(
-          "Expected a response message to be available synchronously"
+        return rejectBatch(
+          new Error("Expected a response message to be available synchronously")
         );
       }
       return handleResponse(
@@ -111,18 +219,35 @@ export function sendRequest(
 }
 
 export function listenForRequests(
-  /** @type {ChannelEnd} */ comm,
+  /** @type {ChannelServer} */ comm,
   /** @type {(data: any) => Promise<any>} */ handler
 ) {
   async function handleRequest(/** @type {Event} */ rawEvent) {
     const event = /** @type {MessageEvent} */ (rawEvent);
-    const { id, data } = event.data;
-    debug?.("server :: request:", data);
+    /** @type {InternalRequestPayload} */
+    const { id, data: requests } = event.data;
+    debug?.("server :: request:", requests);
 
-    const response = await handler(data);
+    /** @type {InternalResponsePayload['data']} */
+    const results = await Promise.all(
+      requests.map(async (request) => {
+        // make sure the `any` on the response type doesn't make us bypass type safety
+        const handlerSafe = /** @type {(arg: unknown) => Promise<unknown>} */ (
+          handler
+        );
+        try {
+          return { status: "fulfilled", value: await handlerSafe(request) };
+        } catch (error) {
+          // TODO: might need to serialize the error somehow here
+          return { status: "rejected", reason: serializeThrown(error) };
+        }
+      })
+    );
 
-    debug?.("server :: sending response:", response);
-    comm.messagePort.postMessage(JSON.stringify({ id, data: response }));
+    debug?.("server :: sending response:", results);
+    /** @type {InternalResponsePayload} */
+    const responsePayload = { id, data: results };
+    comm.messagePort.postMessage(JSON.stringify(responsePayload));
 
     const asArray = new Int32Array(comm.buffer);
     Atomics.store(asArray, ARR_INDEX, ARR_VALUE_STATE.DONE);
@@ -138,4 +263,58 @@ export function listenForRequests(
 
   comm.messagePort.addEventListener("message", handleRequest);
   return () => comm.messagePort.removeEventListener("message", handleRequest);
+}
+
+function serializeThrown(/** @type {unknown} */ error) {
+  if (error && typeof error === "object" && error instanceof Error) {
+    return {
+      message: error.message,
+      stack: error.stack,
+      // TODO: cause
+    };
+  }
+  // this is an edge case, we don't really care, just make it a string
+  return `${error}`;
+}
+
+function deserializeThrown(
+  /** @type {ReturnType<typeof serializeThrown>} */ serialized
+) {
+  if (typeof serialized === "object") {
+    const error = new Error(serialized.message);
+    if (serialized.stack) {
+      error.stack = serialized.stack;
+    }
+    return error;
+  }
+  return serialized;
+}
+
+/** @template T */
+function promiseWithResolvers() {
+  /** @type {(value: T) => void} */
+  let resolve = /** @type {any} */ (undefined);
+  /** @type {(error: unknown) => void} */
+  let reject = /** @type {any} */ (undefined);
+
+  /** @type {Promise<T>} */
+  const promise = new Promise((_resolve, _reject) => {
+    resolve = _resolve;
+    reject = _reject;
+  });
+  return { promise, resolve, reject };
+}
+
+/**
+ * @template T
+ * @returns NonNullable<T>
+ */
+function nullThrows(
+  /** @type {T | undefined | null} */ arg,
+  /** @type {string | undefined} */ message = undefined
+) {
+  if (!arg) {
+    throw new Error(message ?? "Expected value to be non-null");
+  }
+  return arg;
 }

@@ -9,7 +9,7 @@ if (!workerDataRaw) {
 (async () => {
   console.log("main-worker :: hello");
 
-  /** @type {{ comm: import("./utils.mjs").ChannelEnd }} */
+  /** @type {{ comm: import("./utils.mjs").ChannelClient }} */
   const workerData = workerDataRaw;
   const { comm } = workerData;
 
@@ -26,13 +26,6 @@ if (!workerDataRaw) {
   }
 
   {
-    console.log("main-worker :: sending request");
-    const response = await sendRequest(comm, "ping 2");
-    console.log("main-worker :: got response", response, { timeoutRan });
-  }
-
-  {
-    // TODO: these are not actually parallel! each blocks synchronously...
     console.log("main-worker :: sending parallel requests");
     const responses = await Promise.all([
       (console.log("main-worker :: ping 3"), sendRequest(comm, "ping 3")),
