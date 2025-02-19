@@ -65,7 +65,7 @@ export async function createClientHandle(
         "message",
         function handle(rawEvent) {
           const event = /** @type {MessageEvent} */ (rawEvent);
-          const message = JSON.parse(event.data);
+          const message = event.data;
           if (message.id !== requestPayload.id) {
             return;
           }
@@ -180,7 +180,7 @@ export function sendRequest(
     function handleResponse(/** @type {Event} */ rawEvent) {
       const event = /** @type {MessageEvent} */ (rawEvent);
       /** @type {InternalResponsePayload} */
-      const { id: incomingId, data: batchResponse } = JSON.parse(event.data);
+      const { id: incomingId, data: batchResponse } = event.data;
       if (incomingId !== id) {
         return;
       }
@@ -347,7 +347,7 @@ export function listenForRequests(
 
     /** @type {InternalCreateClientResultPayload} */
     const responsePayload = { id, ok: true };
-    sourcePort.postMessage(JSON.stringify(responsePayload));
+    sourcePort.postMessage(responsePayload);
   }
 
   async function handleRequest(
@@ -377,7 +377,7 @@ export function listenForRequests(
     debug?.("server :: sending response:", results);
     /** @type {InternalResponsePayload} */
     const responsePayload = { id, data: results };
-    sourcePort.postMessage(JSON.stringify(responsePayload));
+    sourcePort.postMessage(responsePayload);
 
     const asArray = new Int32Array(comm.buffer);
     Atomics.store(asArray, sourceIndex, ARR_VALUE_STATE.DONE);
