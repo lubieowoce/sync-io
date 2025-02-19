@@ -149,26 +149,13 @@ function createBatch() {
  * */
 
 const USE_SYNC_MESSAGE_RECEIVE = true;
+const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
 
 export function sendRequest(
   /** @type {ChannelClient} */ comm,
   /** @type {any} */ data,
   /** @type {import("node:worker_threads").TransferListItem[]} */ transfer = []
 ) {
-  const waitUntilBatchEnd = () => Promise.resolve();
-
-  const raceBatchStart = () => {
-    const batchLength = comm.batch.items.length;
-    waitUntilBatchEnd().then(() => {
-      // if the batch length didn't change, i.e.g nothing got added after us,
-      // then we're chronologically the last item and our `waitUntilBatchEnd` finished last,
-      // so we have to kick off the batch request.
-      if (comm.batch.items.length === batchLength) {
-        comm.batch.start.resolve();
-      }
-    });
-  };
-
   // if a batch is ongoing, item 0 will handle sending it and resolving the promise,
   // we just need to register ourselves and bump the start timer.
   if (comm.batch.items.length > 0) {
@@ -178,7 +165,7 @@ export function sendRequest(
       transfer,
       controller,
     });
-    raceBatchStart();
+    void raceBatchStart(comm.batch);
     return controller.promise;
   }
 
@@ -239,8 +226,7 @@ export function sendRequest(
     }
 
     comm.batch.items.push({ data, transfer, controller: { resolve, reject } });
-    raceBatchStart();
-    await comm.batch.start.promise;
+    await raceBatchStart(comm.batch);
 
     // we're item 0, so we send the batch
     const requestedBatchItems = comm.batch.items;
@@ -295,6 +281,31 @@ export function sendRequest(
       );
     }
   });
+}
+
+function raceBatchStart(/** @type {Batch} */ batch) {
+  void raceBatchStartImpl(batch);
+  return batch.start.promise;
+}
+
+async function raceBatchStartImpl(/** @type {Batch} */ batch) {
+  // I don't know if there's a way to wait until all pending microtasks are done without leaving the current task.
+  // But what we can do is wait for a while, let other microtasks appear/execute, and then close the batch after a period of time.
+  const initialBatchLength = batch.items.length;
+  for (let i = 0; i < BATCH_MICRO_WAIT_ITERATIONS; i++) {
+    await null;
+    if (batch.items.length !== initialBatchLength) {
+      // the batch length changed, so we're no longer the last item --
+      // the new last item is responsible for resolving the start promise,
+      // and has its own `raceBatchStart` going, so we've got nothing to do here.
+      // (and it's pointless for us to create more microtasks here)
+      return;
+    }
+
+    // if we got here, we waited for `BATCH_MICRO_WAIT_ITERATIONS` and we're still the last item,
+    // so we consider the batch closed and can kick off the request.
+    batch.start.resolve();
+  }
 }
 
 export function listenForRequests(
