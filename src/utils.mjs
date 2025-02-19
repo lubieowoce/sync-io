@@ -10,7 +10,7 @@ const ARR_VALUE_STATE = {
   DONE: 2,
 };
 
-export function createChannel(/** @type {number} */ maxClients = 128) {
+export function createChannel(/** @type {number} */ maxClients = 1) {
   const buffer = new SharedArrayBuffer(
     Int32Array.BYTES_PER_ELEMENT * maxClients
   );
@@ -36,52 +36,70 @@ export async function createClientHandle(
 ) {
   const buffer = channel.serverHandle.buffer;
   const asArray = new Int32Array(buffer);
+  const maxClients = asArray.length;
+
   const index = asArray.indexOf(ARR_VALUE_STATE.NO_CLIENT);
   if (index === -1) {
-    throw new Error(`Cannot create more than ${asArray.length} clients`);
+    throw new Error(`Cannot create more than ${maxClients} clients`);
   }
   asArray[index] = ARR_VALUE_STATE.NOT_DONE;
 
-  // we need separate ports for each client because each MessagePort can only be transferred once
-  const clientChannel = new MessageChannel();
-  await new Promise((resolve, reject) => {
-    // TODO: prevent deadlocks here (if no server exists yet and this is awaited, we might never get a reply)
-    channel.serverMessagePort.addEventListener(
-      "message",
-      function handle(rawEvent) {
-        const event = /** @type {MessageEvent} */ (rawEvent);
-        const message = JSON.parse(event.data);
-        if (message.id !== requestPayload.id) {
-          return;
-        }
-        channel.serverMessagePort.removeEventListener("message", handle);
-        /** @type {InternalCreateClientResultPayload} */
-        const { ok } = message;
-        if (!ok) {
-          return reject(new Error("Failed to register new client with server"));
-        }
-        return resolve(undefined);
-      }
-    );
+  /** @type {MessagePort} */
+  let clientPort;
 
-    /** @type {InternalCreateClientPayload} */
-    const requestPayload = {
-      type: "createClient",
-      id: randomId(),
-      index,
-      messagePort: clientChannel.port2,
-    };
-    debug?.("client :: sending createClient message", requestPayload);
-    channel.serverMessagePort.postMessage(requestPayload, [
-      requestPayload.messagePort,
-    ]);
-  });
+  if (maxClients === 0) {
+    throw new Error("Cannot create client, because maxClients is 0");
+  }
+  if (maxClients === 1) {
+    // there can only ever be one client, so we can use the default port
+    // without doing the whole `createClient` message dance
+    clientPort = channel.serverMessagePort;
+  } else {
+    // we need separate ports for each client because each MessagePort can only be transferred once
+    const clientChannel = new MessageChannel();
+    clientPort = clientChannel.port1;
+
+    await new Promise((resolve, reject) => {
+      // TODO: prevent deadlocks here (if no server exists yet and this is awaited, we might never get a reply)
+      channel.serverMessagePort.addEventListener(
+        "message",
+        function handle(rawEvent) {
+          const event = /** @type {MessageEvent} */ (rawEvent);
+          const message = JSON.parse(event.data);
+          if (message.id !== requestPayload.id) {
+            return;
+          }
+          channel.serverMessagePort.removeEventListener("message", handle);
+          /** @type {InternalCreateClientResultPayload} */
+          const { ok } = message;
+          if (!ok) {
+            return reject(
+              new Error("Failed to register new client with server")
+            );
+          }
+          return resolve(undefined);
+        }
+      );
+
+      /** @type {InternalCreateClientPayload} */
+      const requestPayload = {
+        type: "createClient",
+        id: randomId(),
+        index,
+        messagePort: clientChannel.port2,
+      };
+      debug?.("client :: sending createClient message", requestPayload);
+      channel.serverMessagePort.postMessage(requestPayload, [
+        requestPayload.messagePort,
+      ]);
+    });
+  }
 
   return {
-    messagePort: clientChannel.port1,
+    messagePort: clientPort,
     buffer,
     index,
-    transferList: [clientChannel.port1],
+    transferList: [clientPort],
   };
 }
 
