@@ -391,8 +391,8 @@ function rejectAndRemoveUncloneableBatchItems(
         batchItems[i].controller.reject(err);
         continue;
       }
-      cloneable.push(item);
     }
+    cloneable.push(item);
   }
   return cloneable;
 }
