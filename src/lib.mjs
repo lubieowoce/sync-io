@@ -229,32 +229,41 @@ export function sendRequest(
     await raceBatchStart(comm.batch);
 
     // we're item 0, so we send the batch
-    const requestedBatchItems = comm.batch.items;
+    let requestedBatchItems = comm.batch.items;
     comm.batch = createBatch();
-
-    {
-      /** @type {InternalRequestPayload} */
-      const requestPayload = {
-        type: "request",
-        id,
-        sourceIndex: comm.index,
-        data: requestedBatchItems.map((item) => item.data),
-      };
-      const requestTransferList = requestedBatchItems.flatMap(
-        (item) => item.transfer
-      );
-      debug?.("client :: sending batch", requestPayload, requestTransferList);
-
-      // TODO: handle messageerror here?
-      comm.messagePort.postMessage(requestPayload, requestTransferList);
-    }
 
     const rejectBatch = (/** @type {Error} */ err) => {
       debug?.("client :: rejecting batch", err);
       for (let i = 0; i < requestedBatchItems.length; i++) {
-        requestedBatchItems[i].controller.reject(err);
+        requestedBatchItems[i].controller.reject(
+          new Error("Failed to execute batch", { cause: err })
+        );
       }
     };
+
+    try {
+      sendBatchItems(comm, id, requestedBatchItems);
+    } catch (err) {
+      if (isDataCloneError(err)) {
+        // Some batch items contain uncloneable values.
+        // Find which items couldn't be sent, reject their promises, remove them from the batch,
+        // then try sending it again.
+        const fallbackBatchItems =
+          rejectAndRemoveUncloneableBatchItems(requestedBatchItems);
+        if (fallbackBatchItems.length === 0) {
+          // we already errored all the requests above, nothing left to send.
+          return;
+        }
+        requestedBatchItems = fallbackBatchItems;
+        try {
+          sendBatchItems(comm, id, requestedBatchItems);
+        } catch (err) {
+          // We can't do anything other than error the whole batch.
+          return rejectBatch(err);
+        }
+      }
+      return rejectBatch(err);
+    }
 
     // block event loop while we wait
     const asArray = new Int32Array(comm.buffer);
@@ -281,6 +290,53 @@ export function sendRequest(
       );
     }
   });
+}
+
+function sendBatchItems(
+  /** @type {ChannelClient} */ comm,
+  /** @type {number} */ messageId,
+  /** @type {Batch['items']} */ batchItems
+) {
+  /** @type {InternalRequestPayload} */
+  const requestPayload = {
+    type: "request",
+    id: messageId,
+    sourceIndex: comm.index,
+    data: batchItems.map((item) => item.data),
+  };
+  const requestTransferList = batchItems.flatMap((item) => item.transfer);
+  debug?.("client :: sending batch", requestPayload, requestTransferList);
+  comm.messagePort.postMessage(requestPayload, requestTransferList);
+}
+
+/** @returns {Batch['items']} */
+function rejectAndRemoveUncloneableBatchItems(
+  /** @type {Batch['items']} */ batchItems
+) {
+  /** @type {Batch['items']} */
+  const cloneable = [];
+  for (let i = 0; i < batchItems.length; i++) {
+    const item = batchItems[i];
+    try {
+      // Despite having `item.transfer` here, we can't pass it to `structuredClone` to test
+      // if the error was caused by a incomplete transferList, because then we wouldn't be able to use it again
+      // to actually send the message.
+      structuredClone(item.data);
+    } catch (err) {
+      // Error the items whose arguments could not be cloned, and remove it from the items to be sent.
+      //
+      // Note that this error could also be a `ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST`
+      // (because we can't pass `item.transfer` above),
+      // so we have to check if it's specifically data-cloning.
+      // if not, it'll be thrown again when we retry sending.
+      if (isDataCloneError(err)) {
+        batchItems[i].controller.reject(err);
+        continue;
+      }
+      cloneable.push(item);
+    }
+  }
+  return cloneable;
 }
 
 function raceBatchStart(/** @type {Batch} */ batch) {
