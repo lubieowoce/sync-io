@@ -1,5 +1,5 @@
 // @ts-check
-import { listenForRequests } from "./utils.mjs";
+import { listenForRequests } from "../../lib.mjs";
 import { workerData as workerDataRaw } from "node:worker_threads";
 
 if (!workerDataRaw) {
@@ -7,7 +7,7 @@ if (!workerDataRaw) {
 }
 console.log("cache-worker :: hello");
 
-/** @typedef {{ serverHandle: import("./utils.mjs").ChannelServer }} CacheWorkerData */
+/** @typedef {{ serverHandle: import("../../lib.mjs").ChannelServer }} CacheWorkerData */
 
 /** @type {CacheWorkerData} */
 const workerData = workerDataRaw;
