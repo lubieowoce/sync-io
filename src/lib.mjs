@@ -38,6 +38,10 @@ export async function createClientHandle(
   const asArray = new Int32Array(buffer);
   const maxClients = asArray.length;
 
+  if (maxClients === 0) {
+    throw new Error("Cannot create client, because maxClients is 0");
+  }
+
   const index = asArray.indexOf(ARR_VALUE_STATE.NO_CLIENT);
   if (index === -1) {
     throw new Error(`Cannot create more than ${maxClients} clients`);
@@ -47,9 +51,6 @@ export async function createClientHandle(
   /** @type {MessagePort} */
   let clientPort;
 
-  if (maxClients === 0) {
-    throw new Error("Cannot create client, because maxClients is 0");
-  }
   if (maxClients === 1) {
     // there can only ever be one client, so we can use the default port
     // without doing the whole `createClient` message dance
