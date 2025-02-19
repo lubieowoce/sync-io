@@ -235,6 +235,12 @@ export function sendRequest(
     const timeout = setTimeout(() => {
       timeoutRan = true;
     });
+    const didFinishWithinATask = () => {
+      if (!timeoutRan) {
+        clearTimeout(timeout);
+      }
+      return !timeoutRan;
+    };
 
     function handleResponse(/** @type {Event} */ rawEvent) {
       const event = /** @type {MessageEvent} */ (rawEvent);
@@ -257,15 +263,14 @@ export function sendRequest(
 
       if (!USE_SYNC_MESSAGE_RECEIVE) {
         comm.messagePort.removeEventListener("message", handleResponse);
-        if (timeoutRan) {
-          return rejectBatch(
-            new Error(
-              "Invariant: Did not receive a response message in under a task"
-            )
-          );
-        } else {
-          clearTimeout(timeout);
-        }
+      }
+
+      if (!didFinishWithinATask()) {
+        return rejectBatch(
+          new Error(
+            "Invariant: Did not receive a response message in under a task"
+          )
+        );
       }
 
       for (let i = 0; i < requestedBatchItems.length; i++) {
