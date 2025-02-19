@@ -4,32 +4,84 @@ import { receiveMessageOnPort, MessageChannel } from "node:worker_threads";
 
 const debug = process.env.DEBUG ? console.log : undefined;
 
-const ARR_INDEX = 0;
-
 const ARR_VALUE_STATE = {
-  NOT_DONE: 0,
-  DONE: 1,
+  NO_CLIENT: 0,
+  NOT_DONE: 1,
+  DONE: 2,
 };
 
-/** @returns {{ clientHandle: ChannelClientHandle, server: ChannelServer }} */
-export function createChannel() {
-  const buffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-  const asArray = new Int32Array(buffer);
-  asArray[ARR_INDEX] = ARR_VALUE_STATE.NOT_DONE;
+export function createChannel(/** @type {number} */ maxClients = 128) {
+  const buffer = new SharedArrayBuffer(
+    Int32Array.BYTES_PER_ELEMENT * maxClients
+  );
+  // NOTE: we don't have to initialize the buffer, because NO_CLIENT is 0
 
-  const channel = new MessageChannel();
+  const serverChannel = new MessageChannel();
+  /** @type {ChannelServer} */
+  const serverHandle = {
+    messagePort: serverChannel.port2,
+    buffer,
+    transferList: [serverChannel.port2],
+  };
 
   return {
-    clientHandle: {
-      messagePort: channel.port1,
-      buffer,
-      transferList: [channel.port1],
-    },
-    server: {
-      messagePort: channel.port2,
-      buffer,
-      transferList: [channel.port2],
-    },
+    serverMessagePort: serverChannel.port1,
+    serverHandle,
+  };
+}
+
+/** @returns {Promise<ChannelClientHandle>} */
+export async function createClientHandle(
+  /** @type {ReturnType<createChannel>} */ channel
+) {
+  const buffer = channel.serverHandle.buffer;
+  const asArray = new Int32Array(buffer);
+  const index = asArray.indexOf(ARR_VALUE_STATE.NO_CLIENT);
+  if (index === -1) {
+    throw new Error(`Cannot create more than ${asArray.length} clients`);
+  }
+  asArray[index] = ARR_VALUE_STATE.NOT_DONE;
+
+  // we need separate ports for each client because each MessagePort can only be transferred once
+  const clientChannel = new MessageChannel();
+  await new Promise((resolve, reject) => {
+    // TODO: prevent deadlocks here (if no server exists yet and this is awaited, we might never get a reply)
+    channel.serverMessagePort.addEventListener(
+      "message",
+      function handle(rawEvent) {
+        const event = /** @type {MessageEvent} */ (rawEvent);
+        const message = JSON.parse(event.data);
+        if (message.id !== requestPayload.id) {
+          return;
+        }
+        channel.serverMessagePort.removeEventListener("message", handle);
+        /** @type {InternalCreateClientResultPayload} */
+        const { ok } = message;
+        if (!ok) {
+          return reject(new Error("Failed to register new client with server"));
+        }
+        return resolve(undefined);
+      }
+    );
+
+    /** @type {InternalCreateClientPayload} */
+    const requestPayload = {
+      type: "createClient",
+      id: randomId(),
+      index,
+      messagePort: clientChannel.port2,
+    };
+    debug?.("client :: sending createClient message", requestPayload);
+    channel.serverMessagePort.postMessage(requestPayload, [
+      requestPayload.messagePort,
+    ]);
+  });
+
+  return {
+    messagePort: clientChannel.port1,
+    buffer,
+    index,
+    transferList: [clientChannel.port1],
   };
 }
 
@@ -59,13 +111,19 @@ function createBatch() {
 
 /** @typedef {{ items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> }} Batch */
 
-/** @typedef {{ messagePort: import("node:worker_threads").MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
-/** @typedef {ChannelEndBase} ChannelServer */
-/** @typedef {ChannelEndBase} ChannelClientHandle */
-/** @typedef {ChannelEndBase & { batch: Batch }} ChannelClient */
+/** @typedef {import("node:worker_threads").MessagePort} MessagePort */
 
-/** @typedef {{ id: number, data: unknown[] }} InternalRequestPayload */
+/** @typedef {{ messagePort: MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
+/** @typedef {ChannelEndBase} ChannelServer */
+/** @typedef {ChannelEndBase & { index: number } } ChannelClientHandle */
+/** @typedef {ChannelClientHandle & { batch: Batch }} ChannelClient */
+
+/** @typedef {InternalRequestPayload | InternalCreateClientPayload} InternalMessage */
+/** @typedef {{ type: 'request', id: number, sourceIndex: number, data: unknown[] }} InternalRequestPayload */
 /** @typedef {{ id: number, data: Settled<unknown, ReturnType<typeof serializeThrown>>[] }} InternalResponsePayload */
+
+/** @typedef {{ type: 'createClient', id: number, index: number, messagePort: MessagePort }} InternalCreateClientPayload */
+/** @typedef {{ id: number, ok: boolean }} InternalCreateClientResultPayload */
 
 /**
  * @template T, E
@@ -107,7 +165,7 @@ export function sendRequest(
   }
 
   return new Promise(async (resolve, reject) => {
-    const id = crypto.randomInt(0, Math.pow(2, 48) - 1);
+    const id = randomId();
 
     let timeoutRan = false;
     const timeout = setTimeout(() => {
@@ -173,7 +231,9 @@ export function sendRequest(
     {
       /** @type {InternalRequestPayload} */
       const requestPayload = {
+        type: "request",
         id,
+        sourceIndex: comm.index,
         data: requestedBatchItems.map((item) => item.data),
       };
       const requestTransferList = requestedBatchItems.flatMap(
@@ -195,7 +255,7 @@ export function sendRequest(
     // block event loop while we wait
     const asArray = new Int32Array(comm.buffer);
     debug?.("client :: calling Atomics.wait");
-    const waitRes = Atomics.wait(asArray, ARR_INDEX, ARR_VALUE_STATE.NOT_DONE);
+    const waitRes = Atomics.wait(asArray, comm.index, ARR_VALUE_STATE.NOT_DONE);
     if (waitRes === "not-equal") {
       return rejectBatch(
         new Error(
@@ -223,11 +283,51 @@ export function listenForRequests(
   /** @type {ChannelServer} */ comm,
   /** @type {(data: any) => Promise<any>} */ handler
 ) {
-  async function handleRequest(/** @type {Event} */ rawEvent) {
+  /** @type {(() => void)[]} */
+  const cleanups = [];
+
+  async function handleEvent(/** @type {Event} */ rawEvent) {
     const event = /** @type {MessageEvent} */ (rawEvent);
-    /** @type {InternalRequestPayload} */
-    const { id, data: requests } = event.data;
-    debug?.("server :: request:", requests);
+    /** @type {MessagePort} */
+    const sourcePort = this;
+
+    /** @type {InternalMessage} */
+    const message = event.data;
+    if (message.type === "createClient") {
+      return handleCreateClient(sourcePort, message);
+    } else if (message.type === "request") {
+      return handleRequest(sourcePort, message);
+    } else {
+      console.error("server :: Received unrecognized message", message);
+    }
+  }
+
+  // TODO: destroy
+  async function handleCreateClient(
+    /** @type {MessagePort} */ sourcePort,
+    /** @type {InternalCreateClientPayload} */ message
+  ) {
+    const { id, messagePort } = message;
+
+    // TODO: technically, we shouldn't receive control messages on this port,
+    // but this is maybe fine...?
+    messagePort.addEventListener("message", handleEvent);
+    cleanups.push(() =>
+      messagePort.removeEventListener("message", handleEvent)
+    );
+
+    /** @type {InternalCreateClientResultPayload} */
+    const responsePayload = { id, ok: true };
+    sourcePort.postMessage(JSON.stringify(responsePayload));
+  }
+
+  async function handleRequest(
+    /** @type {MessagePort} */ sourcePort,
+    /** @type {InternalRequestPayload} */ message
+  ) {
+    // request
+    const { id, sourceIndex, data: requests } = message;
+    debug?.(`server :: request from ${sourceIndex}`, requests);
 
     /** @type {InternalResponsePayload['data']} */
     const results = await Promise.all(
@@ -248,22 +348,31 @@ export function listenForRequests(
     debug?.("server :: sending response:", results);
     /** @type {InternalResponsePayload} */
     const responsePayload = { id, data: results };
-    comm.messagePort.postMessage(JSON.stringify(responsePayload));
+    sourcePort.postMessage(JSON.stringify(responsePayload));
 
     const asArray = new Int32Array(comm.buffer);
-    Atomics.store(asArray, ARR_INDEX, ARR_VALUE_STATE.DONE);
-    const notifyRes = Atomics.notify(asArray, ARR_INDEX);
+    Atomics.store(asArray, sourceIndex, ARR_VALUE_STATE.DONE);
+    const notifyRes = Atomics.notify(asArray, sourceIndex);
     if (notifyRes < 1) {
       throw new Error(
         "Invariant: expected Atomics.notify to wake at least one listener"
       );
     }
     debug?.("server :: notified atomic", notifyRes);
-    Atomics.store(asArray, ARR_INDEX, ARR_VALUE_STATE.NOT_DONE);
+    Atomics.store(asArray, sourceIndex, ARR_VALUE_STATE.NOT_DONE);
   }
 
-  comm.messagePort.addEventListener("message", handleRequest);
-  return () => comm.messagePort.removeEventListener("message", handleRequest);
+  comm.messagePort.addEventListener("message", handleEvent);
+  cleanups.push(() =>
+    comm.messagePort.removeEventListener("message", handleEvent)
+  );
+  debug?.("server :: listening");
+
+  return () => {
+    for (const cleanup of cleanups) {
+      cleanup();
+    }
+  };
 }
 
 function serializeThrown(/** @type {unknown} */ error) {
@@ -304,4 +413,8 @@ function promiseWithResolvers() {
     reject = _reject;
   });
   return { promise, resolve, reject };
+}
+
+function randomId() {
+  return crypto.randomInt(0, Math.pow(2, 48) - 1);
 }

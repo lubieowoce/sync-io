@@ -7,13 +7,13 @@ if (!workerDataRaw) {
 }
 console.log("cache-worker :: hello");
 
-/** @typedef {{ comm: import("./utils.mjs").ChannelServer }} CacheWorkerData */
+/** @typedef {{ serverHandle: import("./utils.mjs").ChannelServer }} CacheWorkerData */
 
 /** @type {CacheWorkerData} */
 const workerData = workerDataRaw;
-const { comm } = workerData;
+const { serverHandle } = workerData;
 
-listenForRequests(comm, async (request) => {
+listenForRequests(serverHandle, async (request) => {
   console.log("cache-worker :: got request", request);
 
   // simulate doing actual IO
