@@ -4,17 +4,81 @@ import { receiveMessageOnPort, MessageChannel } from "node:worker_threads";
 
 const debug = process.env.DEBUG ? console.log : undefined;
 
+//===============================================
+// atomics-based primitives that let us block
+//===============================================
+
 const ARR_VALUE_STATE = {
   NO_CLIENT: 0,
   NOT_DONE: 1,
   DONE: 2,
 };
 
-export function createChannel(/** @type {number} */ maxClients = 1) {
+function createStateBuffer(/** @type {number} */ maxClients) {
   const buffer = new SharedArrayBuffer(
     Int32Array.BYTES_PER_ELEMENT * maxClients
   );
   // NOTE: we don't have to initialize the buffer, because NO_CLIENT is 0
+  return buffer;
+}
+
+function getMaxNumClients(/** @type {SharedArrayBuffer} */ buffer) {
+  return buffer.byteLength / Int32Array.BYTES_PER_ELEMENT;
+}
+
+function initializeClientState(/** @type {SharedArrayBuffer} */ buffer) {
+  const asArray = new Int32Array(buffer);
+  const maxClients = asArray.length;
+
+  if (maxClients === 0) {
+    throw new Error("Cannot create client, because maxClients is 0");
+  }
+
+  const index = asArray.indexOf(ARR_VALUE_STATE.NO_CLIENT);
+  if (index === -1) {
+    throw new Error(`Cannot create more than ${maxClients} clients`);
+  }
+  asArray[index] = ARR_VALUE_STATE.NOT_DONE;
+  return index;
+}
+
+function DANGEROUSLY_blockAndWaitForServer(
+  /** @type {SharedArrayBuffer} */ buffer,
+  /** @type {number} */ clientIndex
+) {
+  const asArray = new Int32Array(buffer);
+  debug?.("client :: calling Atomics.wait");
+  const waitRes = Atomics.wait(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
+  if (waitRes === "not-equal") {
+    throw new Error(
+      "Invariant: expected to be in NOT_DONE state when calling Atomics.wait"
+    );
+  }
+  debug?.("client :: Atomics.wait returned", waitRes);
+}
+
+function DANGEROUSLY_wakeBlockedClient(
+  /** @type {SharedArrayBuffer} */ buffer,
+  /** @type {number} */ clientIndex
+) {
+  const asArray = new Int32Array(buffer);
+  Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.DONE);
+  const notifyRes = Atomics.notify(asArray, clientIndex);
+  if (notifyRes < 1) {
+    throw new Error(
+      "Invariant: expected Atomics.notify to wake at least one listener"
+    );
+  }
+  debug?.("server :: notified atomic", notifyRes);
+  Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
+}
+
+//===============================================
+// top-level API
+//===============================================
+
+export function createChannel(/** @type {number} */ maxClients = 1) {
+  const buffer = createStateBuffer(maxClients);
 
   const serverChannel = new MessageChannel();
   /** @type {ChannelServer} */
@@ -30,23 +94,17 @@ export function createChannel(/** @type {number} */ maxClients = 1) {
   };
 }
 
+//===============================================
+// client - will be blocked
+//===============================================
+
 /** @returns {Promise<ChannelClientHandle>} */
 export async function createClientHandle(
   /** @type {ReturnType<createChannel>} */ channel
 ) {
   const buffer = channel.serverHandle.buffer;
-  const asArray = new Int32Array(buffer);
-  const maxClients = asArray.length;
-
-  if (maxClients === 0) {
-    throw new Error("Cannot create client, because maxClients is 0");
-  }
-
-  const index = asArray.indexOf(ARR_VALUE_STATE.NO_CLIENT);
-  if (index === -1) {
-    throw new Error(`Cannot create more than ${maxClients} clients`);
-  }
-  asArray[index] = ARR_VALUE_STATE.NOT_DONE;
+  const index = initializeClientState(buffer);
+  const maxClients = getMaxNumClients(buffer);
 
   /** @type {MessagePort} */
   let clientPort;
@@ -138,7 +196,7 @@ function createBatch() {
 /** @typedef {ChannelClientHandle & { batch: Batch }} ChannelClient */
 
 /** @typedef {InternalRequestPayload | InternalCreateClientPayload} InternalMessage */
-/** @typedef {{ type: 'request', id: number, sourceIndex: number, data: unknown[] }} InternalRequestPayload */
+/** @typedef {{ type: 'request', id: number, clientIndex: number, data: unknown[] }} InternalRequestPayload */
 /** @typedef {{ id: number, data: Settled<unknown, ReturnType<typeof serializeThrown>>[] }} InternalResponsePayload */
 
 /** @typedef {{ type: 'createClient', id: number, index: number, messagePort: MessagePort }} InternalCreateClientPayload */
@@ -267,17 +325,11 @@ export function sendRequest(
     }
 
     // block event loop while we wait
-    const asArray = new Int32Array(comm.buffer);
-    debug?.("client :: calling Atomics.wait");
-    const waitRes = Atomics.wait(asArray, comm.index, ARR_VALUE_STATE.NOT_DONE);
-    if (waitRes === "not-equal") {
-      return rejectBatch(
-        new Error(
-          "Invariant: expected to be in NOT_DONE state when calling Atomics.wait"
-        )
-      );
+    try {
+      DANGEROUSLY_blockAndWaitForServer(comm.buffer, comm.index);
+    } catch (err) {
+      return rejectBatch(err);
     }
-    debug?.("client :: Atomics.wait returned", waitRes);
 
     if (USE_SYNC_MESSAGE_RECEIVE) {
       const msg = receiveMessageOnPort(comm.messagePort);
@@ -302,7 +354,7 @@ function sendBatchItems(
   const requestPayload = {
     type: "request",
     id: messageId,
-    sourceIndex: comm.index,
+    clientIndex: comm.index,
     data: batchItems.map((item) => item.data),
   };
   const requestTransferList = batchItems.flatMap((item) => item.transfer);
@@ -365,6 +417,10 @@ async function raceBatchStartImpl(/** @type {Batch} */ batch) {
   }
 }
 
+//===============================================
+// server - will do work while client is blocked
+//===============================================
+
 export function listenForRequests(
   /** @type {ChannelServer} */ comm,
   /** @type {(data: any) => Promise<any>} */ handler
@@ -412,8 +468,8 @@ export function listenForRequests(
     /** @type {InternalRequestPayload} */ message
   ) {
     // request
-    const { id, sourceIndex, data: requests } = message;
-    debug?.(`server :: request from ${sourceIndex}`, requests);
+    const { id, clientIndex, data: requests } = message;
+    debug?.(`server :: request from ${clientIndex}`, requests);
 
     /** @type {InternalResponsePayload['data']} */
     const results = await Promise.all(
@@ -452,16 +508,7 @@ export function listenForRequests(
       }
     }
 
-    const asArray = new Int32Array(comm.buffer);
-    Atomics.store(asArray, sourceIndex, ARR_VALUE_STATE.DONE);
-    const notifyRes = Atomics.notify(asArray, sourceIndex);
-    if (notifyRes < 1) {
-      throw new Error(
-        "Invariant: expected Atomics.notify to wake at least one listener"
-      );
-    }
-    debug?.("server :: notified atomic", notifyRes);
-    Atomics.store(asArray, sourceIndex, ARR_VALUE_STATE.NOT_DONE);
+    DANGEROUSLY_wakeBlockedClient(comm.buffer, clientIndex);
   }
 
   comm.messagePort.addEventListener("message", handleEvent);
@@ -492,6 +539,10 @@ function replaceUncloneableResultsWithError(
     return result;
   });
 }
+
+//===============================================
+// misc
+//===============================================
 
 /** @returns {err is DOMException} */
 function isDataCloneError(/** @type {unknown} */ err) {
