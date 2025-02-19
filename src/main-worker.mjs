@@ -1,17 +1,21 @@
 // @ts-check
-import { sendRequest } from "./utils.mjs";
+import { createClient, sendRequest } from "./utils.mjs";
 import { workerData as workerDataRaw } from "node:worker_threads";
 
 if (!workerDataRaw) {
   throw new Error("Expected to run within a Worker");
 }
 
+/** @typedef {{ clientHandle: import("./utils.mjs").ChannelClientHandle }} MainWorkerData */
+
 (async () => {
   console.log("main-worker :: hello");
 
-  /** @type {{ comm: import("./utils.mjs").ChannelClient }} */
+  /** @type {MainWorkerData} */
   const workerData = workerDataRaw;
-  const { comm } = workerData;
+  const { clientHandle } = workerData;
+
+  const comm = createClient(clientHandle);
 
   let timeoutRan = false;
   setTimeout(() => {

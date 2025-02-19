@@ -17,13 +17,14 @@ const waitForEnd = async (
 (async () => {
   console.log("root :: hello");
 
-  const { client, server } = createChannel();
+  const { clientHandle, server } = createChannel();
 
   const mainWorker = new Worker(
     new URL(import.meta.resolve("./main-worker.mjs")),
     {
-      workerData: { comm: client },
-      transferList: [...client.transferList],
+      /** @type {import("./main-worker.mjs").MainWorkerData} */
+      workerData: { clientHandle },
+      transferList: [...clientHandle.transferList],
     }
   );
   mainWorker.on("error", (err) => {
@@ -34,6 +35,7 @@ const waitForEnd = async (
   const cacheWorker = new Worker(
     new URL(import.meta.resolve("./cache-worker.mjs")),
     {
+      /** @type {import("./cache-worker.mjs").CacheWorkerData} */
       workerData: { comm: server },
       transferList: [...server.transferList],
     }

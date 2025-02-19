@@ -11,7 +11,7 @@ const ARR_VALUE_STATE = {
   DONE: 1,
 };
 
-/** @returns {{ client: ChannelClient, server: ChannelServer }} */
+/** @returns {{ clientHandle: ChannelClientHandle, server: ChannelServer }} */
 export function createChannel() {
   const buffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
   const asArray = new Int32Array(buffer);
@@ -20,11 +20,10 @@ export function createChannel() {
   const channel = new MessageChannel();
 
   return {
-    client: {
+    clientHandle: {
       messagePort: channel.port1,
       buffer,
       transferList: [channel.port1],
-      batch: createBatch(),
     },
     server: {
       messagePort: channel.port2,
@@ -34,9 +33,17 @@ export function createChannel() {
   };
 }
 
+/** @returns {ChannelClient} */
+export function createClient(/** @type {ChannelClientHandle} */ handle) {
+  return {
+    ...handle,
+    batch: createBatch(),
+  };
+}
+
 /** @returns {Batch} */
 function createBatch() {
-  return { items: [], start: undefined };
+  return { items: [], start: promiseWithResolvers() };
 }
 
 /**
@@ -50,10 +57,11 @@ function createBatch() {
  * @typedef {{ data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: Omit<PromiseWithResolvers<TOut>, 'promise'> }} BatchItem<TIn, TOut>
  */
 
-/** @typedef {{ items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> | undefined }} Batch */
+/** @typedef {{ items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> }} Batch */
 
 /** @typedef {{ messagePort: import("node:worker_threads").MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
 /** @typedef {ChannelEndBase} ChannelServer */
+/** @typedef {ChannelEndBase} ChannelClientHandle */
 /** @typedef {ChannelEndBase & { batch: Batch }} ChannelClient */
 
 /** @typedef {{ id: number, data: unknown[] }} InternalRequestPayload */
@@ -71,13 +79,6 @@ export function sendRequest(
   /** @type {any} */ data,
   /** @type {import("node:worker_threads").TransferListItem[]} */ transfer = []
 ) {
-  // `Batch.start` is not cloneable/transferable so it starts out as undefined
-  // TODO: the stuff we return from `createChannel` really doesn't need to have all the internal state, just the buffer + port.
-  // we should have some kind of init function inside the worker to avoid tricks like this
-  if (!comm.batch.start) {
-    comm.batch.start = promiseWithResolvers();
-  }
-
   const waitUntilBatchEnd = () => Promise.resolve();
 
   const raceBatchStart = () => {
@@ -87,7 +88,7 @@ export function sendRequest(
       // then we're chronologically the last item and our `waitUntilBatchEnd` finished last,
       // so we have to kick off the batch request.
       if (comm.batch.items.length === batchLength) {
-        nullThrows(comm.batch.start).resolve();
+        comm.batch.start.resolve();
       }
     });
   };
@@ -163,7 +164,7 @@ export function sendRequest(
 
     comm.batch.items.push({ data, transfer, controller: { resolve, reject } });
     raceBatchStart();
-    await nullThrows(comm.batch.start).promise;
+    await comm.batch.start.promise;
 
     // we're item 0, so we send the batch
     const requestedBatchItems = comm.batch.items;
@@ -303,18 +304,4 @@ function promiseWithResolvers() {
     reject = _reject;
   });
   return { promise, resolve, reject };
-}
-
-/**
- * @template T
- * @returns NonNullable<T>
- */
-function nullThrows(
-  /** @type {T | undefined | null} */ arg,
-  /** @type {string | undefined} */ message = undefined
-) {
-  if (!arg) {
-    throw new Error(message ?? "Expected value to be non-null");
-  }
-  return arg;
 }

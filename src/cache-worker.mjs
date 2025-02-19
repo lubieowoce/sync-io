@@ -7,7 +7,9 @@ if (!workerDataRaw) {
 }
 console.log("cache-worker :: hello");
 
-/** @type {{ comm: import("./utils.mjs").ChannelServer }} */
+/** @typedef {{ comm: import("./utils.mjs").ChannelServer }} CacheWorkerData */
+
+/** @type {CacheWorkerData} */
 const workerData = workerDataRaw;
 const { comm } = workerData;
 
