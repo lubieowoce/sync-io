@@ -183,7 +183,7 @@ function createBatch() {
 /**
  * @template TIn
  * @template TOut
- * @typedef {{ data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: Omit<PromiseWithResolvers<TOut>, 'promise'> }} BatchItem<TIn, TOut>
+ * @typedef {{ data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: PromiseWithResolvers<TOut> }} BatchItem<TIn, TOut>
  */
 
 /** @typedef {{ items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> }} Batch */
@@ -215,139 +215,152 @@ export function sendRequest(
   /** @type {any} */ data,
   /** @type {import("node:worker_threads").TransferListItem[]} */ transfer = []
 ) {
-  // if a batch is ongoing, item 0 will handle sending it and resolving the promise,
-  // we just need to register ourselves and bump the start timer.
-  if (comm.batch.items.length > 0) {
-    const controller = promiseWithResolvers();
-    comm.batch.items.push({
-      data,
-      transfer,
-      controller,
+  const resultController = promiseWithResolvers();
+
+  const batch = comm.batch;
+  const isFirstItem = batch.items.length === 0;
+  batch.items.push({ data, transfer, controller: resultController });
+
+  const batchStartPromise = raceBatchStart(batch);
+
+  // we want this to only get kicked off once, so only do it for the first item.
+  if (isFirstItem) {
+    void batchStartPromise.then(async () => {
+      comm.batch = createBatch();
+      try {
+        executeBatch(comm, batch);
+      } catch (err) {
+        // something very bad happened. reject the whole batch
+        rejectBatchItems(batch.items, err);
+      }
     });
-    void raceBatchStart(comm.batch);
-    return controller.promise;
   }
 
-  return new Promise(async (resolve, reject) => {
-    const id = randomId();
+  return resultController.promise;
+}
 
-    let timeoutRan = false;
-    const timeout = setTimeout(() => {
-      timeoutRan = true;
-    });
-    const didFinishWithinATask = () => {
-      if (!timeoutRan) {
-        clearTimeout(timeout);
-      }
-      return !timeoutRan;
-    };
+function executeBatch(
+  /** @type {ChannelClient} */ comm,
+  /** @type {Batch} */ batch
+) {
+  let requestedBatchItems = batch.items;
+  const rejectBatch = (/** @type {unknown} */ err) => {
+    rejectBatchItems(requestedBatchItems, err);
+  };
 
-    function handleResponse(/** @type {Event} */ rawEvent) {
-      const event = /** @type {MessageEvent} */ (rawEvent);
-      /** @type {InternalResponsePayload} */
-      const { id: incomingId, data: batchResponse } = event.data;
-      if (incomingId !== id) {
-        return;
-      }
+  /** @type {(() => void)[]} */
+  const cleanups = [];
+  const runCleanups = () => {
+    for (const cleanup of cleanups) {
+      cleanup();
+    }
+    cleanups.length = 0;
+  };
 
-      if (!Array.isArray(batchResponse)) {
-        return rejectBatch(new Error("Invariant: Response is not an array"));
-      }
-      if (batchResponse.length !== requestedBatchItems.length) {
-        return rejectBatch(
-          new Error(
-            `Invariant: Expected response to have length ${requestedBatchItems.length}, got ${batchResponse.length}`
-          )
-        );
-      }
+  // schedule cleanups to run when all promises from the batch are settled
+  void Promise.allSettled(
+    batch.items.map((item) => item.controller.promise)
+  ).then(() => {
+    debug?.("client :: batch settled, running cleanups");
+    runCleanups();
+  });
 
-      if (!USE_SYNC_MESSAGE_RECEIVE) {
-        comm.messagePort.removeEventListener("message", handleResponse);
-      }
+  let timeoutRan = false;
+  const timeout = setTimeout(() => {
+    timeoutRan = true;
+  });
+  cleanups.push(() => clearTimeout(timeout));
+  const didFinishWithinATask = () => {
+    return !timeoutRan;
+  };
 
-      if (!didFinishWithinATask()) {
-        return rejectBatch(
-          new Error(
-            "Invariant: Did not receive a response message in under a task"
-          )
-        );
-      }
+  const messageId = randomId();
 
-      for (let i = 0; i < requestedBatchItems.length; i++) {
-        const result = batchResponse[i];
-        if (result.status === "fulfilled") {
-          requestedBatchItems[i].controller.resolve(result.value);
-        } else {
-          requestedBatchItems[i].controller.reject(
-            deserializeThrown(result.reason)
-          );
-        }
-      }
+  function handleResponse(/** @type {Event} */ rawEvent) {
+    const event = /** @type {MessageEvent} */ (rawEvent);
+    /** @type {InternalResponsePayload} */
+    const { id: incomingId, data: batchResponse } = event.data;
+    if (incomingId !== messageId) {
+      return;
+    }
+
+    if (!Array.isArray(batchResponse)) {
+      return rejectBatch(new Error("Invariant: Response is not an array"));
+    }
+    if (batchResponse.length !== requestedBatchItems.length) {
+      return rejectBatch(
+        new Error(
+          `Invariant: Expected response to have length ${requestedBatchItems.length}, got ${batchResponse.length}`
+        )
+      );
     }
 
     if (!USE_SYNC_MESSAGE_RECEIVE) {
-      comm.messagePort.addEventListener("message", handleResponse);
+      comm.messagePort.removeEventListener("message", handleResponse);
     }
 
-    comm.batch.items.push({ data, transfer, controller: { resolve, reject } });
-    await raceBatchStart(comm.batch);
-
-    // we're item 0, so we send the batch
-    let requestedBatchItems = comm.batch.items;
-    comm.batch = createBatch();
-
-    const rejectBatch = (/** @type {Error} */ err) => {
-      debug?.("client :: rejecting batch", err);
-      for (let i = 0; i < requestedBatchItems.length; i++) {
-        requestedBatchItems[i].controller.reject(
-          new Error("Failed to execute batch", { cause: err })
-        );
-      }
-    };
-
-    try {
-      sendBatchItems(comm, id, requestedBatchItems);
-    } catch (err) {
-      if (isDataCloneError(err)) {
-        // Some batch items contain uncloneable values.
-        // Find which items couldn't be sent, reject their promises, remove them from the batch,
-        // then try sending it again.
-        const fallbackBatchItems =
-          rejectAndRemoveUncloneableBatchItems(requestedBatchItems);
-        if (fallbackBatchItems.length === 0) {
-          // we already errored all the requests above, nothing left to send.
-          return;
-        }
-        requestedBatchItems = fallbackBatchItems;
-        try {
-          sendBatchItems(comm, id, requestedBatchItems);
-        } catch (err) {
-          // We can't do anything other than error the whole batch.
-          return rejectBatch(err);
-        }
-      }
-      return rejectBatch(err);
-    }
-
-    // block event loop while we wait
-    try {
-      DANGEROUSLY_blockAndWaitForServer(comm.buffer, comm.index);
-    } catch (err) {
-      return rejectBatch(err);
-    }
-
-    if (USE_SYNC_MESSAGE_RECEIVE) {
-      const msg = receiveMessageOnPort(comm.messagePort);
-      if (!msg) {
-        return rejectBatch(
-          new Error("Expected a response message to be available synchronously")
-        );
-      }
-      return handleResponse(
-        /** @type {MessageEvent} */ ({ data: msg.message })
+    if (!didFinishWithinATask()) {
+      return rejectBatch(
+        new Error(
+          "Invariant: Did not receive a response message in under a task"
+        )
       );
     }
-  });
+
+    settleBatchItemsFromResponse(requestedBatchItems, batchResponse);
+  }
+
+  if (!USE_SYNC_MESSAGE_RECEIVE) {
+    comm.messagePort.addEventListener("message", handleResponse);
+    cleanups.push(() =>
+      comm.messagePort.removeEventListener("message", handleResponse)
+    );
+  }
+
+  try {
+    sendBatchItems(comm, messageId, requestedBatchItems);
+  } catch (err) {
+    if (isDataCloneError(err)) {
+      // Some batch items contain uncloneable values.
+      // Find which items couldn't be sent, reject their promises, remove them from the batch,
+      // then try sending it again.
+      debug?.("client :: unclonable items in batch");
+      const fallbackBatchItems =
+        rejectAndRemoveUncloneableBatchItems(requestedBatchItems);
+      if (fallbackBatchItems.length === 0) {
+        // we already errored all the requests above, nothing left to send.
+        return;
+      }
+      requestedBatchItems = fallbackBatchItems;
+      try {
+        sendBatchItems(comm, messageId, requestedBatchItems);
+      } catch (err) {
+        // We can't do anything other than error the whole batch.
+        return rejectBatch(err);
+      }
+    } else {
+      return rejectBatch(err);
+    }
+  }
+
+  // block event loop while we wait
+  try {
+    DANGEROUSLY_blockAndWaitForServer(comm.buffer, comm.index);
+  } catch (err) {
+    return rejectBatch(err);
+  }
+
+  if (USE_SYNC_MESSAGE_RECEIVE) {
+    const msg = receiveMessageOnPort(comm.messagePort);
+    if (!msg) {
+      return rejectBatch(
+        new Error("Expected a response message to be available synchronously")
+      );
+    }
+    // TODO: this doesn't work if we get a message with a non-matching id,
+    // because we're only waiting for one message here. but can that actually happen?
+    return handleResponse(/** @type {MessageEvent} */ ({ data: msg.message }));
+  }
 }
 
 function sendBatchItems(
@@ -365,6 +378,32 @@ function sendBatchItems(
   const requestTransferList = batchItems.flatMap((item) => item.transfer);
   debug?.("client :: sending batch", requestPayload, requestTransferList);
   comm.messagePort.postMessage(requestPayload, requestTransferList);
+}
+
+function settleBatchItemsFromResponse(
+  /** @type {Batch['items']} */ batchItems,
+  /** @type {InternalResponsePayload['data']} */ batchResponse
+) {
+  for (let i = 0; i < batchItems.length; i++) {
+    const result = batchResponse[i];
+    if (result.status === "fulfilled") {
+      batchItems[i].controller.resolve(result.value);
+    } else {
+      batchItems[i].controller.reject(deserializeThrown(result.reason));
+    }
+  }
+}
+
+function rejectBatchItems(
+  /** @type {Batch['items']} */ batchItems,
+  /** @type {unknown} */ err
+) {
+  debug?.("client :: rejecting batch", err);
+  for (let i = 0; i < batchItems.length; i++) {
+    batchItems[i].controller.reject(
+      new Error("Failed to execute batch", { cause: err })
+    );
+  }
 }
 
 /** @returns {Batch['items']} */
