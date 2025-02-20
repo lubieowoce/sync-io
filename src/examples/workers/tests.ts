@@ -12,6 +12,7 @@ export async function runTests(client: ChannelClient, name: string) {
   const loremIpsum = createProxy(client, "loremIpsum");
   const getPost = createProxy(client, "getPost");
   const unserializableResponse = createProxy(client, "unserializableResponse");
+  const noop = createProxy(client, "noop");
 
   setTimeout(() => {
     console.log(`${name} :: hello from timeout!`);
@@ -83,7 +84,7 @@ export async function runTests(client: ChannelClient, name: string) {
 
     await test("uncloneable argument", async () => {
       await assert.rejects(
-        () => unserializableResponse({ promise: Promise.resolve() }),
+        () => noop({ promise: Promise.resolve() }),
         /#<Promise> could not be cloned\./,
         undefined
       );
@@ -92,7 +93,7 @@ export async function runTests(client: ChannelClient, name: string) {
     await test("uncloneable argument in batch", async () => {
       const results = await Promise.allSettled([
         loremIpsum("x"),
-        unserializableResponse({ promise: Promise.resolve() }),
+        noop({ promise: Promise.resolve() }),
       ]);
 
       const value0 = assertIsFulfilled(results[0]);
@@ -104,7 +105,7 @@ export async function runTests(client: ChannelClient, name: string) {
 
     await test("untransferable argument", async () => {
       await assert.rejects(
-        () => unserializableResponse(new MessageChannel().port1),
+        () => noop(new MessageChannel().port1),
         /Object that needs transfer was found in message but not listed in transferList/,
         undefined
       );
@@ -113,7 +114,7 @@ export async function runTests(client: ChannelClient, name: string) {
     await test("untransferable argument in batch", async () => {
       const results = await Promise.allSettled([
         loremIpsum("x"),
-        unserializableResponse(new MessageChannel().port1),
+        noop(new MessageChannel().port1),
       ]);
 
       // it's a bit unfortunate that we reject the first promise too,

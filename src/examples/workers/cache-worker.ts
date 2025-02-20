@@ -44,6 +44,10 @@ const functions = {
   async unserializableResponse() {
     return { promise: Promise.resolve("oops") };
   },
+
+  async noop(..._args: any[]) {
+    return null;
+  },
 };
 
 export type CachedFunctionCall = { functionId: string; args: any[] };
