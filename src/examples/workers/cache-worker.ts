@@ -1,4 +1,4 @@
-import { listenForRequests } from "../../lib.js";
+import { listenForRequests, type ChannelServer } from "../../lib.js";
 import { workerData as workerDataRaw } from "node:worker_threads";
 
 if (!workerDataRaw) {
@@ -47,15 +47,13 @@ const functions = {
 };
 
 export type CachedFunctionCall = { functionId: string; args: any[] };
-
 export type CachedFunctions = typeof functions;
 
 export type CacheWorkerData = {
-  serverHandle: import("../../lib.js").ChannelServer;
+  serverHandle: ChannelServer;
 };
 
-/** @type {CacheWorkerData} */
-const workerData = workerDataRaw;
+const workerData = workerDataRaw as CacheWorkerData;
 const { serverHandle } = workerData;
 
 listenForRequests(serverHandle, async (request: CachedFunctionCall) => {

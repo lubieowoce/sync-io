@@ -27,8 +27,7 @@ const waitForEnd = async (worker: Worker) => {
     process.exit(1);
   });
 
-  /** @type {Worker[]} */
-  const mainWorkers = [];
+  const mainWorkers: Worker[] = [];
   for (let i = 1; i <= 2; i++) {
     const clientHandle = await createClientHandle(channel);
     const mainWorker = new Worker(
