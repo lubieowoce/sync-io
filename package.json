@@ -9,9 +9,9 @@
   },
   "scripts": {
     "build": "tsc",
-    "example-react": "NODE_ENV=production node --conditions=react-server dist/examples/example-react.js",
-    "example-react:bun": "NODE_ENV=production bun --conditions=react-server src/examples/example-react.ts",
-    "test": "node dist/examples/example-single-renderer.js"
+    "example:react-one-worker": "NODE_ENV=production node --conditions=react-server dist/examples/example-react-one-worker.js",
+    "example:react-two-workers": "NODE_ENV=production node --conditions=react-server dist/examples/example-react-two-workers.js",
+    "test": "node dist/examples/tests-main.js"
   },
   "author": "",
   "license": "ISC",
