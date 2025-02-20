@@ -1,5 +1,5 @@
 import { ChannelClient, sendRequest } from "../../lib.js";
-import type { CachedFunctionCall, CachedFunctions } from "./cache-worker.js";
+import type { CachedFunctionCall, CachedFunctions } from "./cache-functions.js";
 
 export type FunctionIds = keyof CachedFunctions;
 

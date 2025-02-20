@@ -1,6 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { createChannel, createClientHandle } from "../lib.js";
-import type { MainWorkerData } from "./workers/react-worker.js";
+import type { ReactWorkerData } from "./workers/react-worker.js";
 import type { CacheWorkerData } from "./workers/cache-worker.js";
 
 const waitForBoot = async (worker: Worker) => {
@@ -20,7 +20,7 @@ const waitForEnd = async (worker: Worker) => {
   const mainWorker = new Worker(
     new URL(import.meta.resolve("./workers/react-worker.js")),
     {
-      workerData: { clientHandle, id: 1 } satisfies MainWorkerData,
+      workerData: { clientHandle, id: 1 } satisfies ReactWorkerData,
       transferList: [...clientHandle.transferList],
     }
   );

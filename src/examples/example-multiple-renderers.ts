@@ -1,7 +1,7 @@
 import { Worker } from "node:worker_threads";
 import { createChannel, createClientHandle } from "../lib.js";
 import type { CacheWorkerData } from "./workers/cache-worker.js";
-import type { MainWorkerData } from "./workers/render-worker.js";
+import type { TestWorkerData } from "./workers/test-worker.js";
 
 const waitForEnd = async (worker: Worker) => {
   await new Promise((resolve) => worker.on("exit", () => resolve(undefined)));
@@ -31,9 +31,9 @@ const waitForEnd = async (worker: Worker) => {
   for (let i = 1; i <= 2; i++) {
     const clientHandle = await createClientHandle(channel);
     const mainWorker = new Worker(
-      new URL(import.meta.resolve("./workers/render-worker.js")),
+      new URL(import.meta.resolve("./workers/test-worker.js")),
       {
-        workerData: { clientHandle, id: i } satisfies MainWorkerData,
+        workerData: { clientHandle, id: i } satisfies TestWorkerData,
         transferList: [...clientHandle.transferList],
       }
     );
