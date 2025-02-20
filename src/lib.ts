@@ -221,9 +221,11 @@ export type ChannelClient = ChannelClientHandle & {
 type InternalMessage = InternalRequestPayload | InternalCreateClientPayload;
 type InternalRequestPayload = {
   type: "request";
+  id: number;
   clientIndex: number;
-  items: { id: number; data: unknown }[];
+  data: unknown;
 };
+
 type InternalResponsePayload = {
   id: number;
   data: Settled<unknown, ReturnType<typeof serializeThrown>>;
@@ -302,40 +304,26 @@ export function sendRequest(
 }
 
 function executeBatch(client: ChannelClient, batch: Batch) {
-  try {
-    sendBatchItems(client, batch.items);
-  } catch (err) {
-    // We don't know if this is an error with one of the items
-    // (uncloneable value / missing item in transferList)
-    // or something with the whole communication channel.
-    // This isn't really recoverable anyway, so for better DX,
-    // we can try to send each request separately.
-    // If only one of the items is causing an error, we'll end up only rejecting that one,
-    // and the error will show up in the correct place.
-    for (const batchItem of batch.items) {
-      try {
-        sendBatchItems(client, [batchItem]);
-      } catch (err) {
-        batchItem.controller.reject(err);
-      }
+  for (const item of batch.items) {
+    try {
+      sendItem(client, item);
+      addTaskToPoller(client, item);
+    } catch (err) {
+      item.controller.reject(err);
     }
-  }
-
-  for (const batchItem of batch.items) {
-    addTaskToPoller(client, batchItem);
   }
   startPolling(client);
 }
 
-function sendBatchItems(client: ChannelClient, batchItems: Batch["items"]) {
+function sendItem(client: ChannelClient, item: BatchItem<any, any>) {
   const requestPayload: InternalRequestPayload = {
     type: "request",
     clientIndex: client.index,
-    items: batchItems.map((item) => ({ id: item.id, data: item.data })),
+    id: item.id,
+    data: item.data,
   };
-  const requestTransferList = batchItems.flatMap((item) => item.transfer);
-  debug?.("client :: sending batch", requestPayload, requestTransferList);
-  client.messagePort.postMessage(requestPayload, requestTransferList);
+  debug?.("client :: sending", requestPayload, item.transfer);
+  client.messagePort.postMessage(requestPayload, item.transfer);
 }
 
 function rejectBatchItems(batchItems: Batch["items"], err: unknown) {
@@ -544,17 +532,18 @@ export function listenForRequests(
       messagePort.removeEventListener("message", handleEvent)
     );
 
-    const responsePayload: InternalCreateClientResultPayload = { id, ok: true };
+    const responsePayload: InternalCreateClientResultPayload = {
+      id,
+      ok: true,
+    };
     sourcePort.postMessage(responsePayload);
   }
 
   async function handleRequest(
     sourcePort: MessagePort,
-    message: InternalRequestPayload
+    request: InternalRequestPayload
   ) {
-    // request
-    const { clientIndex, items: requests } = message;
-    debug?.(`server :: request from ${clientIndex}`, requests);
+    debug?.(`server :: request from ${request.clientIndex}`, request.data);
 
     async function safelyRunHandler(
       requestData: unknown
@@ -569,39 +558,37 @@ export function listenForRequests(
       }
     }
 
-    requests.forEach(async (request) => {
-      const result = await safelyRunHandler(request.data);
-      const responsePayload: InternalResponsePayload = {
-        id: request.id,
-        data: result,
-      };
+    const result = await safelyRunHandler(request.data);
+    const responsePayload: InternalResponsePayload = {
+      id: request.id,
+      data: result,
+    };
 
-      debug?.(`server :: sending response (${request.id})`, result);
+    debug?.(`server :: sending response (${request.id})`, result);
+    try {
+      sourcePort.postMessage(responsePayload);
+    } catch (err) {
       try {
-        sourcePort.postMessage(responsePayload);
-      } catch (err) {
-        try {
-          // Try sending an error result instead -- maybe the returned value was uncloneable.
-          const fallbackResponsePayload: InternalResponsePayload = {
-            id: request.id,
-            data: { status: "rejected", reason: serializeThrown(err) },
-          };
-          sourcePort.postMessage(fallbackResponsePayload);
-        } catch (secondErr) {
-          // If we can't even send an error result, something is very wrong,
-          // all we can do is crash (presumably leaving the client hanging forever)
-          throw secondErr;
-        }
+        // Try sending an error result instead -- maybe the returned value was uncloneable.
+        const fallbackResponsePayload: InternalResponsePayload = {
+          id: request.id,
+          data: { status: "rejected", reason: serializeThrown(err) },
+        };
+        sourcePort.postMessage(fallbackResponsePayload);
+      } catch (secondErr) {
+        // If we can't even send an error result, something is very wrong,
+        // all we can do is crash (presumably leaving the client hanging forever)
+        throw secondErr;
       }
+    }
 
-      try {
-        DANGEROUSLY_maybeWakeBlockedClient(server.buffer, clientIndex);
-      } catch (err) {
-        throw new Error(`Error while waking client for ${request.id}`, {
-          cause: err,
-        });
-      }
-    });
+    try {
+      DANGEROUSLY_maybeWakeBlockedClient(server.buffer, request.clientIndex);
+    } catch (err) {
+      throw new Error(`Error while waking client for ${request.id}`, {
+        cause: err,
+      });
+    }
   }
 
   server.messagePort.addEventListener("message", handleEvent);
