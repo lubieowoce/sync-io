@@ -1,8 +1,28 @@
 // @ts-check
 import * as crypto from "node:crypto";
+import { inspect } from "node:util";
 import { receiveMessageOnPort, MessageChannel } from "node:worker_threads";
 
-const debug = process.env.DEBUG ? console.log : undefined;
+let isClientWorker = false;
+const clientWorkerLogs = [];
+
+const CLIENT_LOGS_BUFFER = false;
+const debug = process.env.DEBUG
+  ? (...args) => {
+      if (CLIENT_LOGS_BUFFER && isClientWorker) {
+        clientWorkerLogs.push(args);
+      } else {
+        console.log(...args);
+      }
+    }
+  : undefined;
+
+if (CLIENT_LOGS_BUFFER) {
+  process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled rejection", reason);
+    console.log(clientWorkerLogs);
+  });
+}
 
 //===============================================
 // atomics-based primitives that let us block
@@ -44,33 +64,30 @@ function initializeClientState(/** @type {SharedArrayBuffer} */ buffer) {
 
 function DANGEROUSLY_blockAndWaitForServer(
   /** @type {SharedArrayBuffer} */ buffer,
-  /** @type {number} */ clientIndex
+  /** @type {number} */ clientIndex,
+  /** @type {string | undefined} */ source = undefined
 ) {
   const asArray = new Int32Array(buffer);
-  debug?.("client :: calling Atomics.wait");
+  debug?.("client :: calling Atomics.wait", source);
   const waitRes = Atomics.wait(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
   if (waitRes === "not-equal") {
     throw new Error(
       "Invariant: expected to be in NOT_DONE state when calling Atomics.wait"
     );
   }
-  debug?.("client :: Atomics.wait returned", waitRes);
+  debug?.("client :: " + "=".repeat(80));
+  debug?.("client :: Atomics.wait returned", waitRes, source);
 }
 
-function DANGEROUSLY_wakeBlockedClient(
+function DANGEROUSLY_maybeWakeBlockedClient(
   /** @type {SharedArrayBuffer} */ buffer,
   /** @type {number} */ clientIndex
 ) {
   const asArray = new Int32Array(buffer);
-  Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.DONE);
+  // Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.DONE);
   const notifyRes = Atomics.notify(asArray, clientIndex);
-  if (notifyRes < 1) {
-    throw new Error(
-      "Invariant: expected Atomics.notify to wake at least one listener"
-    );
-  }
   debug?.("server :: notified atomic", notifyRes);
-  Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
+  // Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
 }
 
 //===============================================
@@ -162,17 +179,28 @@ export async function createClientHandle(
   };
 }
 
-/** @returns {ChannelClient} */
 export function createClient(/** @type {ChannelClientHandle} */ handle) {
-  return {
+  isClientWorker = true;
+
+  let poller;
+  /** @type {ChannelClient} */
+  const comm = {
     ...handle,
     batch: createBatch(),
+    get poller() {
+      if (!poller) {
+        poller = createBatchPoller(comm);
+      }
+      return poller;
+    },
   };
+
+  return comm;
 }
 
 /** @returns {Batch} */
 function createBatch() {
-  return { items: [], start: promiseWithResolvers() };
+  return { items: [], start: promiseWithResolvers(), id: randomId() };
 }
 
 /**
@@ -186,18 +214,18 @@ function createBatch() {
  * @typedef {{ data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: PromiseWithResolvers<TOut> }} BatchItem<TIn, TOut>
  */
 
-/** @typedef {{ items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> }} Batch */
+/** @typedef {{ id: number, items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> }} Batch */
 
 /** @typedef {import("node:worker_threads").MessagePort} MessagePort */
 
 /** @typedef {{ messagePort: MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
 /** @typedef {ChannelEndBase} ChannelServer */
 /** @typedef {ChannelEndBase & { index: number } } ChannelClientHandle */
-/** @typedef {ChannelClientHandle & { batch: Batch }} ChannelClient */
+/** @typedef {ChannelClientHandle & { batch: Batch, poller: BatchPoller }} ChannelClient */
 
 /** @typedef {InternalRequestPayload | InternalCreateClientPayload} InternalMessage */
-/** @typedef {{ type: 'request', id: number, clientIndex: number, data: unknown[] }} InternalRequestPayload */
-/** @typedef {{ id: number, data: Settled<unknown, ReturnType<typeof serializeThrown>>[] }} InternalResponsePayload */
+/** @typedef {{ type: 'request', batchId: number, clientIndex: number, data: unknown[] }} InternalRequestPayload */
+/** @typedef {{ batchId: number, index: number, data: Settled<unknown, ReturnType<typeof serializeThrown>> }} InternalResponsePayload */
 
 /** @typedef {{ type: 'createClient', id: number, index: number, messagePort: MessagePort }} InternalCreateClientPayload */
 /** @typedef {{ id: number, ok: boolean }} InternalCreateClientResultPayload */
@@ -207,8 +235,112 @@ function createBatch() {
  * @typedef {{ status: 'fulfilled', value: T } | { status: 'rejected', reason: E }} Settled<T, E>
  * */
 
-const USE_SYNC_MESSAGE_RECEIVE = true;
+const POLLER_YIELD_ITERATIONS = 50; // arbitrary long-ish number (still much cheaper than serializing IO)
 const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
+
+function createBatchPoller(/** @type {ChannelClient} */ comm) {
+  /** @type {Map<number, { batch: Batch, controller: PromiseWithResolvers<InternalResponsePayload> }>} */
+  const waiters = new Map();
+
+  function getBatchStatus(/** @type {Batch} */ batch) {
+    if (batch.start.status === "fulfilled") {
+      // batch started executing
+      return getPendingBatchItemCount(batch.items) > 0 ? "running" : "done";
+    } else {
+      return "not-started";
+    }
+  }
+
+  function getRunningBatchCount() {
+    return [...waiters.values()].filter(
+      (waiter) => getBatchStatus(waiter.batch) === "running"
+    ).length;
+  }
+
+  /** @type {Promise<void> | undefined} */
+  let readLoop;
+  function isPolling() {
+    return !!readLoop;
+  }
+  async function startPolling() {
+    readLoop = startPollingImpl();
+    try {
+      await readLoop;
+    } finally {
+      readLoop = undefined;
+    }
+  }
+  async function startPollingImpl() {
+    while (true) {
+      // TODO: this feels like an awkward place to put this
+      if (!getRunningBatchCount()) {
+        debug?.("client :: exiting read loop");
+        readLoop = undefined;
+        return;
+      }
+
+      const received = receiveMessageOnPort(comm.messagePort);
+      debug?.(
+        "client :: receiveMessageOnPort",
+        received,
+        received?.message?.batchId
+      );
+      if (!received) {
+        // if possible, wait for a batch to start to maximize parallelism
+        const wipBatch = comm.batch;
+        if (wipBatch.items.length > 0) {
+          debug?.(`client :: waiting for WIP batch to get submitted`);
+          await wipBatch.start.promise;
+          continue;
+        } else {
+          try {
+            DANGEROUSLY_blockAndWaitForServer(
+              comm.buffer,
+              comm.index,
+              `poller`
+            );
+            continue;
+          } catch (err) {
+            console.error("client :: error in poller", err);
+            throw err;
+          }
+        }
+      }
+
+      /** @type {InternalResponsePayload} */
+      const message = received.message;
+      const waiter = waiters.get(message.batchId);
+      if (!waiter) {
+        // TODO: queue?
+        throw new Error(
+          `Invariant :: poller got message for batch that is not waiting (${message.batchId})`
+        );
+      }
+      debug?.("client :: yielding to batch", waiter.batch.id);
+      waiter.controller.resolve(message);
+      waiters.delete(message.batchId);
+
+      // yield and let other code run.
+      for (let i = 0; i < POLLER_YIELD_ITERATIONS; i++) {
+        await null;
+      }
+    }
+  }
+
+  return {
+    waitForMessage(/** @type {Batch} */ batch) {
+      /** @type {PromiseWithResolvers<InternalResponsePayload>} */
+      const controller = promiseWithResolvers();
+      waiters.set(batch.id, { batch, controller });
+      if (!isPolling()) {
+        void startPolling();
+      }
+      return controller.promise;
+    },
+  };
+}
+
+/** @typedef {ReturnType<typeof createBatchPoller>} BatchPoller */
 
 export function sendRequest(
   /** @type {ChannelClient} */ comm,
@@ -220,6 +352,11 @@ export function sendRequest(
   const batch = comm.batch;
   const isFirstItem = batch.items.length === 0;
   batch.items.push({ data, transfer, controller: resultController });
+  debug?.(
+    "client :: sendRequest",
+    data,
+    `(current batch: ${batch.items.length} items)`
+  );
 
   const batchStartPromise = raceBatchStart(batch);
 
@@ -228,7 +365,7 @@ export function sendRequest(
     void batchStartPromise.then(async () => {
       comm.batch = createBatch();
       try {
-        executeBatch(comm, batch);
+        await executeBatch(comm, batch);
       } catch (err) {
         // something very bad happened. reject the whole batch
         rejectBatchItems(batch.items, err);
@@ -239,7 +376,7 @@ export function sendRequest(
   return resultController.promise;
 }
 
-function executeBatch(
+async function executeBatch(
   /** @type {ChannelClient} */ comm,
   /** @type {Batch} */ batch
 ) {
@@ -274,51 +411,8 @@ function executeBatch(
     return !timeoutRan;
   };
 
-  const messageId = randomId();
-
-  function handleResponse(/** @type {Event} */ rawEvent) {
-    const event = /** @type {MessageEvent} */ (rawEvent);
-    /** @type {InternalResponsePayload} */
-    const { id: incomingId, data: batchResponse } = event.data;
-    if (incomingId !== messageId) {
-      return;
-    }
-
-    if (!Array.isArray(batchResponse)) {
-      return rejectBatch(new Error("Invariant: Response is not an array"));
-    }
-    if (batchResponse.length !== requestedBatchItems.length) {
-      return rejectBatch(
-        new Error(
-          `Invariant: Expected response to have length ${requestedBatchItems.length}, got ${batchResponse.length}`
-        )
-      );
-    }
-
-    if (!USE_SYNC_MESSAGE_RECEIVE) {
-      comm.messagePort.removeEventListener("message", handleResponse);
-    }
-
-    if (!didFinishWithinATask()) {
-      return rejectBatch(
-        new Error(
-          "Invariant: Did not receive a response message in under a task"
-        )
-      );
-    }
-
-    settleBatchItemsFromResponse(requestedBatchItems, batchResponse);
-  }
-
-  if (!USE_SYNC_MESSAGE_RECEIVE) {
-    comm.messagePort.addEventListener("message", handleResponse);
-    cleanups.push(() =>
-      comm.messagePort.removeEventListener("message", handleResponse)
-    );
-  }
-
   try {
-    sendBatchItems(comm, messageId, requestedBatchItems);
+    sendBatchItems(comm, batch.id, requestedBatchItems);
   } catch (err) {
     if (isDataCloneError(err)) {
       // Some batch items contain uncloneable values.
@@ -333,7 +427,7 @@ function executeBatch(
       }
       requestedBatchItems = fallbackBatchItems;
       try {
-        sendBatchItems(comm, messageId, requestedBatchItems);
+        sendBatchItems(comm, batch.id, requestedBatchItems);
       } catch (err) {
         // We can't do anything other than error the whole batch.
         return rejectBatch(err);
@@ -343,35 +437,60 @@ function executeBatch(
     }
   }
 
-  // block event loop while we wait
-  try {
-    DANGEROUSLY_blockAndWaitForServer(comm.buffer, comm.index);
-  } catch (err) {
-    return rejectBatch(err);
+  while (true) {
+    const message = await comm.poller.waitForMessage(batch);
+    handleResponse(message);
+
+    const pendingCount = getPendingBatchItemCount(requestedBatchItems);
+    if (pendingCount === 0) {
+      break;
+    }
   }
 
-  if (USE_SYNC_MESSAGE_RECEIVE) {
-    const msg = receiveMessageOnPort(comm.messagePort);
-    if (!msg) {
+  function handleResponse(/** @type {InternalResponsePayload} */ message) {
+    debug?.("client :: handleResponse", message);
+    if (message.batchId !== batch.id) {
+      debug?.(
+        `client :: handleResponse[${batch.id}]: got message for different batch (${message.batchId})`
+      );
+      return;
+    }
+    const { index: batchItemIndex, data: batchItemResult } = message;
+
+    if (!didFinishWithinATask()) {
       return rejectBatch(
-        new Error("Expected a response message to be available synchronously")
+        new Error(
+          "Invariant: Did not receive a response message in under a task"
+        )
       );
     }
-    // TODO: this doesn't work if we get a message with a non-matching id,
-    // because we're only waiting for one message here. but can that actually happen?
-    return handleResponse(/** @type {MessageEvent} */ ({ data: msg.message }));
+
+    if (batchItemResult.status === "fulfilled") {
+      requestedBatchItems[batchItemIndex].controller.resolve(
+        batchItemResult.value
+      );
+    } else {
+      requestedBatchItems[batchItemIndex].controller.reject(
+        deserializeThrown(batchItemResult.reason)
+      );
+    }
   }
+}
+
+function getPendingBatchItemCount(/** @type {Batch['items']} */ batchItems) {
+  return batchItems.filter((item) => item.controller.status === "pending")
+    .length;
 }
 
 function sendBatchItems(
   /** @type {ChannelClient} */ comm,
-  /** @type {number} */ messageId,
+  /** @type {number} */ batchId,
   /** @type {Batch['items']} */ batchItems
 ) {
   /** @type {InternalRequestPayload} */
   const requestPayload = {
     type: "request",
-    id: messageId,
+    batchId,
     clientIndex: comm.index,
     data: batchItems.map((item) => item.data),
   };
@@ -380,19 +499,6 @@ function sendBatchItems(
   comm.messagePort.postMessage(requestPayload, requestTransferList);
 }
 
-function settleBatchItemsFromResponse(
-  /** @type {Batch['items']} */ batchItems,
-  /** @type {InternalResponsePayload['data']} */ batchResponse
-) {
-  for (let i = 0; i < batchItems.length; i++) {
-    const result = batchResponse[i];
-    if (result.status === "fulfilled") {
-      batchItems[i].controller.resolve(result.value);
-    } else {
-      batchItems[i].controller.reject(deserializeThrown(result.reason));
-    }
-  }
-}
 
 function rejectBatchItems(
   /** @type {Batch['items']} */ batchItems,
@@ -511,47 +617,60 @@ export function listenForRequests(
     /** @type {InternalRequestPayload} */ message
   ) {
     // request
-    const { id, clientIndex, data: requests } = message;
+    const { batchId, clientIndex, data: requests } = message;
     debug?.(`server :: request from ${clientIndex}`, requests);
 
-    /** @type {InternalResponsePayload['data']} */
-    const results = await Promise.all(
-      requests.map(async (request) => {
-        // make sure the `any` on the response type doesn't make us bypass type safety
-        const handlerSafe = /** @type {(arg: unknown) => Promise<unknown>} */ (
-          handler
-        );
-        try {
-          return { status: "fulfilled", value: await handlerSafe(request) };
-        } catch (error) {
-          // TODO: might need to serialize the error somehow here
-          return { status: "rejected", reason: serializeThrown(error) };
-        }
-      })
-    );
-
-    debug?.("server :: sending response:", results);
-    /** @type {InternalResponsePayload} */
-    const responsePayload = { id, data: results };
-    try {
-      sourcePort.postMessage(responsePayload);
-    } catch (err) {
-      if (isDataCloneError(err)) {
-        // We tried to respond with something uncloneable.
-        // find out which results caused this and error them.
-        /** @type {InternalResponsePayload} */
-        const fallbackResponsePayload = {
-          id,
-          data: replaceUncloneableResultsWithError(results),
-        };
-        sourcePort.postMessage(fallbackResponsePayload);
-      } else {
-        // nothing more we can do here
-        throw err;
+    /** @returns {Promise<Settled<unknown, ReturnType<typeof serializeThrown>>>} */
+    async function runRequest(request) {
+      // make sure the `any` on the response type doesn't make us bypass type safety
+      const handlerSafe = /** @type {(arg: unknown) => Promise<unknown>} */ (
+        handler
+      );
+      try {
+        return { status: "fulfilled", value: await handlerSafe(request) };
+      } catch (error) {
+        // TODO: might need to serialize the error somehow here
+        return { status: "rejected", reason: serializeThrown(error) };
       }
     }
 
-    DANGEROUSLY_wakeBlockedClient(comm.buffer, clientIndex);
+    requests.forEach(async (request, index) => {
+      const result = await runRequest(request);
+      /** @type {InternalResponsePayload} */
+      const responsePayload = {
+        batchId,
+        index,
+        data: result,
+      };
+
+      debug?.(`server :: sending response (${batchId}[${index}])`, result);
+      try {
+        sourcePort.postMessage(responsePayload);
+      } catch (err) {
+        if (isDataCloneError(err)) {
+          // We tried to respond with something uncloneable.
+          // find out which results caused this and error them.
+          /** @type {InternalResponsePayload} */
+          const fallbackResponsePayload = {
+            batchId,
+            index,
+            data: replaceUncloneableResultWithError(result),
+          };
+          sourcePort.postMessage(fallbackResponsePayload);
+        } else {
+          // nothing more we can do here
+          throw err;
+        }
+      }
+
+      try {
+        DANGEROUSLY_maybeWakeBlockedClient(comm.buffer, clientIndex);
+      } catch (err) {
+        throw new Error(`Error while waking client for ${batchId}[${index}]`, {
+          cause: err,
+        });
+      }
+    });
   }
 
   comm.messagePort.addEventListener("message", handleEvent);
@@ -568,19 +687,17 @@ export function listenForRequests(
 }
 
 /** @returns {InternalResponsePayload['data']} */
-function replaceUncloneableResultsWithError(
-  /** @type {InternalResponsePayload['data']} */ results
+function replaceUncloneableResultWithError(
+  /** @type {InternalResponsePayload['data']} */ result
 ) {
-  return results.map((result) => {
-    try {
-      structuredClone(
-        result.status === "fulfilled" ? result.value : result.reason
-      );
-    } catch (err) {
-      return { status: "rejected", reason: serializeThrown(err) };
-    }
-    return result;
-  });
+  try {
+    structuredClone(
+      result.status === "fulfilled" ? result.value : result.reason
+    );
+  } catch (err) {
+    return { status: "rejected", reason: serializeThrown(err) };
+  }
+  return result;
 }
 
 //===============================================
@@ -631,12 +748,32 @@ function promiseWithResolvers() {
   /** @type {(error: unknown) => void} */
   let reject = /** @type {any} */ (undefined);
 
+  /** @type {'pending' | 'fulfilled' | 'rejected'} */
+  let status = "pending";
+
   /** @type {Promise<T>} */
   const promise = new Promise((_resolve, _reject) => {
-    resolve = _resolve;
-    reject = _reject;
+    resolve = (value) => {
+      if (status === "pending") {
+        status = "fulfilled";
+      }
+      _resolve(value);
+    };
+    reject = (value) => {
+      if (status === "pending") {
+        status = "rejected";
+      }
+      _reject(value);
+    };
   });
-  return { promise, resolve, reject };
+  return {
+    promise,
+    resolve,
+    reject,
+    get status() {
+      return status;
+    },
+  };
 }
 
 function randomId() {

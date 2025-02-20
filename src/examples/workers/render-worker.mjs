@@ -27,6 +27,31 @@ if (!workerDataRaw) {
   }, 0);
 
   {
+    const completions = [];
+    const trackCompletion = (promise, label) => {
+      promise.then(() => completions.push(label));
+      return promise;
+    };
+    const equals = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+    console.log(
+      `render-worker ${id} :: sending parallel requests`,
+      await Promise.all([
+        (async () => {
+          await trackCompletion(loremIpsum("1"), `loremIpsum("1")`);
+          await trackCompletion(loremIpsum("2"), `loremIpsum("2")`);
+        })(),
+        trackCompletion(getPost(1), `getPost(1)`),
+      ])
+    );
+    if (
+      !equals(completions, [`loremIpsum("1")`, `loremIpsum("2")`, `getPost(1)`])
+    ) {
+      throw new Error("Wrong order of completions");
+    }
+  }
+
+  {
     await (console.log(`render-worker ${id} :: loremIpsum("boop")`),
     loremIpsum("boop"));
   }
