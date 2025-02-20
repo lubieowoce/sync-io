@@ -6,7 +6,7 @@ let isClientWorker = false;
 /** @type {any[][]} */
 const clientWorkerLogs = [];
 
-const CLIENT_LOGS_BUFFER = true;
+const CLIENT_LOGS_BUFFER = false;
 const debug = process.env.DEBUG
   ? (/** @type {any[]} */ ...args) => {
       if (CLIENT_LOGS_BUFFER && isClientWorker) {
