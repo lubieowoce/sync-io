@@ -604,31 +604,9 @@ export function listenForRequests(
   };
 }
 
-function replaceUncloneableResultWithError(
-  result: InternalResponsePayload["data"]
-): InternalResponsePayload["data"] {
-  try {
-    structuredClone(
-      result.status === "fulfilled" ? result.value : result.reason
-    );
-  } catch (err) {
-    return { status: "rejected", reason: serializeThrown(err) };
-  }
-  return result;
-}
-
 //===============================================
 // misc
 //===============================================
-
-function isDataCloneError(err: unknown): err is DOMException {
-  return !!(
-    err &&
-    typeof err === "object" &&
-    err instanceof DOMException &&
-    err.name === "DataCloneError"
-  );
-}
 
 function serializeThrown(error: unknown) {
   if (error && typeof error === "object" && error instanceof Error) {
