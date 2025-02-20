@@ -47,6 +47,10 @@ listenForRequests(
   async (/** @type {CachedFunctionCall} */ request) => {
     console.log("cache-worker :: got request", request);
     const { functionId, args } = request;
-    return functions[functionId](...args);
+
+    /** @type {(...args: any[]) => unknown} */
+    const func = functions[/** @type {keyof typeof functions} */ (functionId)];
+
+    return func(...args);
   }
 );

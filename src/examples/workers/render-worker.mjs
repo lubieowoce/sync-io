@@ -27,12 +27,19 @@ if (!workerDataRaw) {
   }, 0);
 
   {
+    /** @type {string[]} */
     const completions = [];
-    const trackCompletion = (promise, label) => {
+    /** @template T */
+    const trackCompletion = (
+      /** @type {Promise<T>} */ promise,
+      /** @type {string} */ label
+    ) => {
       promise.then(() => completions.push(label));
       return promise;
     };
-    const equals = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+    const equals = (/** @type {any} */ a, /** @type {any} */ b) =>
+      JSON.stringify(a) === JSON.stringify(b);
 
     console.log(
       `render-worker ${id} :: sending parallel requests`,

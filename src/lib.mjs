@@ -1,14 +1,14 @@
 // @ts-check
 import * as crypto from "node:crypto";
-import { inspect } from "node:util";
 import { receiveMessageOnPort, MessageChannel } from "node:worker_threads";
 
 let isClientWorker = false;
+/** @type {any[][]} */
 const clientWorkerLogs = [];
 
 const CLIENT_LOGS_BUFFER = true;
 const debug = process.env.DEBUG
-  ? (...args) => {
+  ? (/** @type {any[]} */ ...args) => {
       if (CLIENT_LOGS_BUFFER && isClientWorker) {
         clientWorkerLogs.push(args);
       } else {
@@ -592,13 +592,13 @@ export function listenForRequests(
     debug?.(`server :: request from ${clientIndex}`, requests);
 
     /** @returns {Promise<Settled<unknown, ReturnType<typeof serializeThrown>>>} */
-    async function runRequest(request) {
+    async function safelyRunHandler(/** @type {unknown} */ requestData) {
       // make sure the `any` on the response type doesn't make us bypass type safety
-      const handlerSafe = /** @type {(arg: unknown) => Promise<unknown>} */ (
+      const _handler = /** @type {(arg: unknown) => Promise<unknown>} */ (
         handler
       );
       try {
-        return { status: "fulfilled", value: await handlerSafe(request) };
+        return { status: "fulfilled", value: await _handler(requestData) };
       } catch (error) {
         // TODO: might need to serialize the error somehow here
         return { status: "rejected", reason: serializeThrown(error) };
@@ -606,7 +606,7 @@ export function listenForRequests(
     }
 
     requests.forEach(async (request) => {
-      const result = await runRequest(request.data);
+      const result = await safelyRunHandler(request.data);
       /** @type {InternalResponsePayload} */
       const responsePayload = {
         id: request.id,
