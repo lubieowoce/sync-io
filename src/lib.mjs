@@ -269,7 +269,10 @@ export function sendRequest(
         executeBatch(client, batch);
       } catch (err) {
         // something very bad happened. reject the whole batch
-        rejectBatchItems(batch.items, err);
+        rejectBatchItems(
+          batch.items,
+          new Error("Internal error: executeBatch crashed", { cause: err })
+        );
       }
     });
   }
@@ -348,10 +351,21 @@ function rejectBatchItems(
   /** @type {unknown} */ err
 ) {
   debug?.("client :: rejecting batch", err);
+
+  if (batchItems.length === 1) {
+    // if there's only one task, we can error it directly.
+    if (batchItems[0].controller.status === "pending") {
+      batchItems[0].controller.reject(err);
+    }
+    return;
+  }
+
   for (let i = 0; i < batchItems.length; i++) {
-    batchItems[i].controller.reject(
-      new Error("Failed to execute batched task", { cause: err })
-    );
+    if (batchItems[i].controller.status === "pending") {
+      batchItems[i].controller.reject(
+        new Error("Failed to execute batched task", { cause: err })
+      );
+    }
   }
 }
 
