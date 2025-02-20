@@ -16,11 +16,11 @@ if (!workerDataRaw) {
 
   console.log(`render-worker ${id} :: hello`);
 
-  const comm = createClient(clientHandle);
+  const client = createClient(clientHandle);
 
-  const loremIpsum = createProxy(comm, "loremIpsum");
-  const getPost = createProxy(comm, "getPost");
-  const unserializableResponse = createProxy(comm, "unserializableResponse");
+  const loremIpsum = createProxy(client, "loremIpsum");
+  const getPost = createProxy(client, "getPost");
+  const unserializableResponse = createProxy(client, "unserializableResponse");
 
   setTimeout(() => {
     console.log(`render-worker ${id} :: hello from timeout!`);
