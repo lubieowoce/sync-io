@@ -48,13 +48,16 @@ export type CachedFunctionCall = { functionId: string; args: any[] };
 export type CachedFunctions = typeof functions;
 
 export function runCacheServer(serverHandle: ChannelServer) {
-  listenForRequests(serverHandle, async (request: CachedFunctionCall) => {
-    console.log("cache-worker :: got request", request);
-    const { functionId, args } = request;
+  return listenForRequests(
+    serverHandle,
+    async (request: CachedFunctionCall) => {
+      console.log("cache-worker :: got request", request);
+      const { functionId, args } = request;
 
-    const func: (...args: any[]) => unknown =
-      functions[functionId as keyof typeof functions];
+      const func: (...args: any[]) => unknown =
+        functions[functionId as keyof typeof functions];
 
-    return func(...args);
-  });
+      return func(...args);
+    }
+  );
 }
