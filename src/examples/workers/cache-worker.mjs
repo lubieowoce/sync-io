@@ -7,34 +7,38 @@ if (!workerDataRaw) {
 }
 console.log("cache-worker :: hello");
 
+const GET_POST_MOCK = false;
+
 const functions = {
   async loremIpsum(/** @type {string} */ arg) {
     console.log("loremIpsum", arg);
 
     // simulate doing actual IO
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
     return "Lorem ipsum, dolor sit amet" + ` (${new Date().toISOString()})`;
   },
 
   async getPost(/** @type {number} */ postId) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    return {
-      userId: 1,
-      id: postId,
-      title: "Test",
-      body: "Lorem ipsum dolor sit amet",
-    };
-
-    // const response = await fetch(
-    //   `https://jsonplaceholder.typicode.com/posts/${postId}`
-    // );
-    // if (!response.ok) {
-    //   throw new Error("Failed to fetch");
-    // }
-    // /** @type {{userId: number, id: number, title: string, body: string}} */
-    // const result = await response.json();
-    // return result;
+    if (GET_POST_MOCK) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return {
+        userId: 1,
+        id: postId,
+        title: "Test",
+        body: "Lorem ipsum dolor sit amet",
+      };
+    } else {
+      const response = await fetch(
+        `https://jsonplaceholder.typicode.com/posts/${postId}`
+      );
+      if (!response.ok) {
+        throw new Error(`Request not ok: ${response.status}`);
+      }
+      /** @type {{userId: number, id: number, title: string, body: string}} */
+      const result = await response.json();
+      return result;
+    }
   },
 
   async unserializableResponse() {
