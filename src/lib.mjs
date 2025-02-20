@@ -473,7 +473,7 @@ async function runPollLoopUntilDone(/** @type {ChannelClient} */ client) {
           );
           continue;
         } catch (err) {
-          throw new Error("Invariant: could perform a blocking wait", {
+          throw new Error("Invariant: could not perform a blocking wait", {
             cause: err,
           });
         }
