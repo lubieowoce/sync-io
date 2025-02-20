@@ -302,40 +302,26 @@ export function sendRequest(
 }
 
 function executeBatch(client: ChannelClient, batch: Batch) {
-  let batchItemsToRequest = batch.items;
-
-  const rejectBatch = (err: unknown) => {
-    rejectBatchItems(batchItemsToRequest, err);
-  };
-
   try {
-    sendBatchItems(client, batchItemsToRequest);
+    sendBatchItems(client, batch.items);
   } catch (err) {
-    if (isDataCloneError(err)) {
-      // Some batch items contain uncloneable values.
-      // Find which items couldn't be sent, reject their promises, remove them from the batch,
-      // then try sending it again.
-      debug?.("client :: unclonable items in batch");
-      const fallbackBatchItems =
-        rejectAndRemoveUncloneableBatchItems(batchItemsToRequest);
-      if (fallbackBatchItems.length === 0) {
-        // we already errored all the requests above, nothing left to send.
-        return;
-      }
-      batchItemsToRequest = fallbackBatchItems;
+    // We don't know if this is an error with one of the items
+    // (uncloneable value / missing item in transferList)
+    // or something with the whole communication channel.
+    // This isn't really recoverable anyway, so for better DX,
+    // we can try to send each request separately.
+    // If only one of the items is causing an error, we'll end up only rejecting that one,
+    // and the error will show up in the correct place.
+    for (const batchItem of batch.items) {
       try {
-        sendBatchItems(client, batchItemsToRequest);
+        sendBatchItems(client, [batchItem]);
       } catch (err) {
-        // We can't do anything other than error the whole batch.
-        return rejectBatch(err);
+        batchItem.controller.reject(err);
       }
-    } else {
-      return rejectBatch(err);
     }
   }
-  const requestedBatchItems = batchItemsToRequest;
 
-  for (const batchItem of requestedBatchItems) {
+  for (const batchItem of batch.items) {
     addTaskToPoller(client, batchItem);
   }
   startPolling(client);
@@ -370,34 +356,6 @@ function rejectBatchItems(batchItems: Batch["items"], err: unknown) {
       );
     }
   }
-}
-
-function rejectAndRemoveUncloneableBatchItems(
-  batchItems: Batch["items"]
-): Batch["items"] {
-  const cloneable: Batch["items"] = [];
-  for (let i = 0; i < batchItems.length; i++) {
-    const item = batchItems[i];
-    try {
-      // Despite having `item.transfer` here, we can't pass it to `structuredClone` to test
-      // if the error was caused by a incomplete transferList, because then we wouldn't be able to use it again
-      // to actually send the message.
-      structuredClone(item.data);
-    } catch (err) {
-      // Error the items whose arguments could not be cloned, and remove it from the items to be sent.
-      //
-      // Note that this error could also be a `ERR_MISSING_TRANSFERABLE_IN_TRANSFER_LIST`
-      // (because we can't pass `item.transfer` above),
-      // so we have to check if it's specifically data-cloning.
-      // if not, it'll be thrown again when we retry sending.
-      if (isDataCloneError(err)) {
-        batchItems[i].controller.reject(err);
-        continue;
-      }
-    }
-    cloneable.push(item);
-  }
-  return cloneable;
 }
 
 function raceBatchStart(batch: Batch) {
@@ -622,17 +580,17 @@ export function listenForRequests(
       try {
         sourcePort.postMessage(responsePayload);
       } catch (err) {
-        if (isDataCloneError(err)) {
-          // We tried to respond with something uncloneable.
-          // find out which results caused this and error them.
+        try {
+          // Try sending an error result instead -- maybe the returned value was uncloneable.
           const fallbackResponsePayload: InternalResponsePayload = {
             id: request.id,
-            data: replaceUncloneableResultWithError(result),
+            data: { status: "rejected", reason: serializeThrown(err) },
           };
           sourcePort.postMessage(fallbackResponsePayload);
-        } else {
-          // nothing more we can do here
-          throw err;
+        } catch (secondErr) {
+          // If we can't even send an error result, something is very wrong,
+          // all we can do is crash (presumably leaving the client hanging forever)
+          throw secondErr;
         }
       }
 

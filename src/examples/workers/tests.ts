@@ -118,17 +118,12 @@ export async function runTests(client: ChannelClient, name: string) {
 
       // it's a bit unfortunate that we reject the first promise too,
       // but it's hard to do better and it's a hard error anyway
-      const reason0 = assertIsRejected(results[0]);
-      assert.match(reason0.message, /Failed to execute batched task/);
-      assert.match(
-        reason0.cause.message,
-        /Object that needs transfer was found in message but not listed in transferList/
-      );
+      const value0 = assertIsFulfilled(results[0]);
+      assertIsLoremIpsum(value0);
 
       const reason1 = assertIsRejected(results[1]);
-      assert.match(reason1.message, /Failed to execute batched task/);
       assert.match(
-        reason1.cause.message,
+        reason1.message,
         /Object that needs transfer was found in message but not listed in transferList/
       );
     });
