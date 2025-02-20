@@ -184,18 +184,18 @@ export function createClient(/** @type {ChannelClientHandle} */ handle) {
 
   let poller;
   /** @type {ChannelClient} */
-  const comm = {
+  const client = {
     ...handle,
     batch: createBatch(),
     get poller() {
       if (!poller) {
-        poller = createResponsePoller(comm);
+        poller = createResponsePoller(client);
       }
       return poller;
     },
   };
 
-  return comm;
+  return client;
 }
 
 /** @returns {Batch} */
@@ -241,7 +241,7 @@ function createBatch() {
 const POLLER_YIELD_ITERATIONS = 50; // arbitrary long-ish number (still much cheaper than serializing IO)
 const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
 
-function createResponsePoller(/** @type {ChannelClient} */ comm) {
+function createResponsePoller(/** @type {ChannelClient} */ client) {
   /** @type {Map<number, PollerTask<unknown>>} */
   const pollerTasks = new Map();
 
@@ -290,7 +290,7 @@ function createResponsePoller(/** @type {ChannelClient} */ comm) {
         return;
       }
 
-      const received = receiveMessageOnPort(comm.messagePort);
+      const received = receiveMessageOnPort(client.messagePort);
       debug?.(
         "client :: receiveMessageOnPort",
         received,
@@ -298,7 +298,7 @@ function createResponsePoller(/** @type {ChannelClient} */ comm) {
       );
       if (!received) {
         // if possible, wait for a batch to start to maximize parallelism
-        const wipBatch = comm.batch;
+        const wipBatch = client.batch;
         if (wipBatch.items.length > 0) {
           debug?.(`client :: waiting for WIP batch to get submitted`);
           await wipBatch.start.promise;
@@ -306,8 +306,8 @@ function createResponsePoller(/** @type {ChannelClient} */ comm) {
         } else {
           try {
             DANGEROUSLY_blockAndWaitForServer(
-              comm.buffer,
-              comm.index,
+              client.buffer,
+              client.index,
               `poller`
             );
             continue;
@@ -354,7 +354,7 @@ function createResponsePoller(/** @type {ChannelClient} */ comm) {
 /** @typedef {ReturnType<typeof createResponsePoller>} ResponsePoller */
 
 export function sendRequest(
-  /** @type {ChannelClient} */ comm,
+  /** @type {ChannelClient} */ client,
   /** @type {any} */ data,
   /** @type {import("node:worker_threads").TransferListItem[]} */ transfer = []
 ) {
@@ -365,7 +365,7 @@ export function sendRequest(
 
   const resultController = promiseWithResolvers();
 
-  const batch = comm.batch;
+  const batch = client.batch;
   const isFirstItem = batch.items.length === 0;
   batch.items.push({
     id: randomId(),
@@ -384,9 +384,9 @@ export function sendRequest(
   // we want this to only get kicked off once, so only do it for the first item.
   if (isFirstItem) {
     void batchStartPromise.then(async () => {
-      comm.batch = createBatch();
+      client.batch = createBatch();
       try {
-        executeBatch(comm, batch);
+        executeBatch(client, batch);
       } catch (err) {
         // something very bad happened. reject the whole batch
         rejectBatchItems(batch.items, err);
@@ -406,7 +406,7 @@ export function sendRequest(
 }
 
 function executeBatch(
-  /** @type {ChannelClient} */ comm,
+  /** @type {ChannelClient} */ client,
   /** @type {Batch} */ batch
 ) {
   let batchItemsToRequest = batch.items;
@@ -416,7 +416,7 @@ function executeBatch(
   };
 
   try {
-    sendBatchItems(comm, batchItemsToRequest);
+    sendBatchItems(client, batchItemsToRequest);
   } catch (err) {
     if (isDataCloneError(err)) {
       // Some batch items contain uncloneable values.
@@ -431,7 +431,7 @@ function executeBatch(
       }
       batchItemsToRequest = fallbackBatchItems;
       try {
-        sendBatchItems(comm, batchItemsToRequest);
+        sendBatchItems(client, batchItemsToRequest);
       } catch (err) {
         // We can't do anything other than error the whole batch.
         return rejectBatch(err);
@@ -443,24 +443,24 @@ function executeBatch(
   const requestedBatchItems = batchItemsToRequest;
 
   for (const batchItem of requestedBatchItems) {
-    comm.poller.add(batchItem);
+    client.poller.add(batchItem);
   }
-  comm.poller.startPolling();
+  client.poller.startPolling();
 }
 
 function sendBatchItems(
-  /** @type {ChannelClient} */ comm,
+  /** @type {ChannelClient} */ client,
   /** @type {Batch['items']} */ batchItems
 ) {
   /** @type {InternalRequestPayload} */
   const requestPayload = {
     type: "request",
-    clientIndex: comm.index,
+    clientIndex: client.index,
     items: batchItems.map((item) => ({ id: item.id, data: item.data })),
   };
   const requestTransferList = batchItems.flatMap((item) => item.transfer);
   debug?.("client :: sending batch", requestPayload, requestTransferList);
-  comm.messagePort.postMessage(requestPayload, requestTransferList);
+  client.messagePort.postMessage(requestPayload, requestTransferList);
 }
 
 /** @template T */
@@ -546,7 +546,7 @@ async function raceBatchStartImpl(/** @type {Batch} */ batch) {
 //===============================================
 
 export function listenForRequests(
-  /** @type {ChannelServer} */ comm,
+  /** @type {ChannelServer} */ server,
   /** @type {(data: any) => Promise<any>} */ handler
 ) {
   /** @type {(() => void)[]} */
@@ -637,7 +637,7 @@ export function listenForRequests(
       }
 
       try {
-        DANGEROUSLY_maybeWakeBlockedClient(comm.buffer, clientIndex);
+        DANGEROUSLY_maybeWakeBlockedClient(server.buffer, clientIndex);
       } catch (err) {
         throw new Error(`Error while waking client for ${request.id}`, {
           cause: err,
@@ -646,9 +646,9 @@ export function listenForRequests(
     });
   }
 
-  comm.messagePort.addEventListener("message", handleEvent);
+  server.messagePort.addEventListener("message", handleEvent);
   cleanups.push(() =>
-    comm.messagePort.removeEventListener("message", handleEvent)
+    server.messagePort.removeEventListener("message", handleEvent)
   );
   debug?.("server :: listening");
 
