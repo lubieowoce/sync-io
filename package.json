@@ -1,11 +1,15 @@
 {
   "name": "sync-io",
   "version": "1.0.0",
-  "description": "",
+  "description": "Easy time dilation for your Node.js workers",
+  "author": "Janka Uryga <lolzatu2@gmail.com>",
+  "license": "MIT",
   "type": "module",
-  "module": "src/main.mjs",
-  "napi": {
-    "name": "sync-io"
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.js"
+    }
   },
   "scripts": {
     "build": "tsc",
@@ -13,18 +17,16 @@
     "example:react-two-workers": "NODE_ENV=production node --conditions=react-server dist/examples/example-react-two-workers.js",
     "test": "node dist/examples/tests-main.js"
   },
-  "author": "",
-  "license": "ISC",
+  "dependencies": {
+    "react": "0.0.0-experimental-a84862db-20250218",
+    "react-dom": "0.0.0-experimental-a84862db-20250218",
+    "react-server-dom-webpack": "0.0.0-experimental-a84862db-20250218"
+  },
   "devDependencies": {
     "@types/node": "^22.13.4",
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",
     "typescript": "^5.7.3"
   },
-  "packageManager": "pnpm@9.8.0+sha512.8e4c3550fb500e808dbc30bb0ce4dd1eb614e30b1c55245f211591ec2cdf9c611cabd34e1364b42f564bd54b3945ed0f49d61d1bbf2ec9bd74b866fcdc723276",
-  "dependencies": {
-    "react": "0.0.0-experimental-a84862db-20250218",
-    "react-dom": "0.0.0-experimental-a84862db-20250218",
-    "react-server-dom-webpack": "0.0.0-experimental-a84862db-20250218"
-  }
+  "packageManager": "pnpm@9.8.0+sha512.8e4c3550fb500e808dbc30bb0ce4dd1eb614e30b1c55245f211591ec2cdf9c611cabd34e1364b42f564bd54b3945ed0f49d61d1bbf2ec9bd74b866fcdc723276"
 }
