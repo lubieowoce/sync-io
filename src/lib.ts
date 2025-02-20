@@ -1,14 +1,17 @@
-// @ts-check
 import * as crypto from "node:crypto";
-import { receiveMessageOnPort, MessageChannel } from "node:worker_threads";
+import {
+  receiveMessageOnPort,
+  MessageChannel,
+  type TransferListItem,
+  type MessagePort,
+} from "node:worker_threads";
 
 let isClientWorker = false;
-/** @type {any[][]} */
-const clientWorkerLogs = [];
+const clientWorkerLogs: any[][] = [];
 
 const CLIENT_LOGS_BUFFER = false;
 const debug = process.env.DEBUG
-  ? (/** @type {any[]} */ ...args) => {
+  ? (...args: any[]) => {
       if (CLIENT_LOGS_BUFFER && isClientWorker) {
         clientWorkerLogs.push(args);
       } else {
@@ -34,7 +37,7 @@ const ARR_VALUE_STATE = {
   DONE: 2,
 };
 
-function createStateBuffer(/** @type {number} */ maxClients) {
+function createStateBuffer(maxClients: number) {
   const buffer = new SharedArrayBuffer(
     Int32Array.BYTES_PER_ELEMENT * maxClients
   );
@@ -42,11 +45,11 @@ function createStateBuffer(/** @type {number} */ maxClients) {
   return buffer;
 }
 
-function getMaxNumClients(/** @type {SharedArrayBuffer} */ buffer) {
+function getMaxNumClients(buffer: SharedArrayBuffer) {
   return buffer.byteLength / Int32Array.BYTES_PER_ELEMENT;
 }
 
-function initializeClientState(/** @type {SharedArrayBuffer} */ buffer) {
+function initializeClientState(buffer: SharedArrayBuffer) {
   const asArray = new Int32Array(buffer);
   const maxClients = asArray.length;
 
@@ -63,9 +66,9 @@ function initializeClientState(/** @type {SharedArrayBuffer} */ buffer) {
 }
 
 function DANGEROUSLY_blockAndWaitForServer(
-  /** @type {SharedArrayBuffer} */ buffer,
-  /** @type {number} */ clientIndex,
-  /** @type {string | undefined} */ source = undefined
+  buffer: SharedArrayBuffer,
+  clientIndex: number,
+  source: string | undefined = undefined
 ) {
   const asArray = new Int32Array(buffer);
   debug?.("client :: calling Atomics.wait", source);
@@ -80,8 +83,8 @@ function DANGEROUSLY_blockAndWaitForServer(
 }
 
 function DANGEROUSLY_maybeWakeBlockedClient(
-  /** @type {SharedArrayBuffer} */ buffer,
-  /** @type {number} */ clientIndex
+  buffer: SharedArrayBuffer,
+  clientIndex: number
 ) {
   const asArray = new Int32Array(buffer);
   // Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.DONE);
@@ -94,12 +97,11 @@ function DANGEROUSLY_maybeWakeBlockedClient(
 // top-level API
 //===============================================
 
-export function createChannel(/** @type {number} */ maxClients = 1) {
+export function createChannel(maxClients: number = 1) {
   const buffer = createStateBuffer(maxClients);
 
   const serverChannel = new MessageChannel();
-  /** @type {ChannelServer} */
-  const serverHandle = {
+  const serverHandle: ChannelServer = {
     messagePort: serverChannel.port2,
     buffer,
     transferList: [serverChannel.port2],
@@ -115,16 +117,14 @@ export function createChannel(/** @type {number} */ maxClients = 1) {
 // client - will be blocked
 //===============================================
 
-/** @returns {Promise<ChannelClientHandle>} */
 export async function createClientHandle(
-  /** @type {ReturnType<createChannel>} */ channel
-) {
+  channel: ReturnType<typeof createChannel>
+): Promise<ChannelClientHandle> {
   const buffer = channel.serverHandle.buffer;
   const index = initializeClientState(buffer);
   const maxClients = getMaxNumClients(buffer);
 
-  /** @type {MessagePort} */
-  let clientPort;
+  let clientPort: MessagePort;
 
   if (maxClients === 1) {
     // there can only ever be one client, so we can use the default port
@@ -139,15 +139,14 @@ export async function createClientHandle(
       // TODO: prevent deadlocks here (if no server exists yet and this is awaited, we might never get a reply)
       channel.serverMessagePort.addEventListener(
         "message",
-        function handle(rawEvent) {
-          const event = /** @type {MessageEvent} */ (rawEvent);
+        function handle(rawEvent: Event) {
+          const event = rawEvent as MessageEvent;
           const message = event.data;
           if (message.id !== requestPayload.id) {
             return;
           }
           channel.serverMessagePort.removeEventListener("message", handle);
-          /** @type {InternalCreateClientResultPayload} */
-          const { ok } = message;
+          const { ok } = message as InternalCreateClientResultPayload;
           if (!ok) {
             return reject(
               new Error("Failed to register new client with server")
@@ -157,8 +156,7 @@ export async function createClientHandle(
         }
       );
 
-      /** @type {InternalCreateClientPayload} */
-      const requestPayload = {
+      const requestPayload: InternalCreateClientPayload = {
         type: "createClient",
         id: randomId(),
         index,
@@ -179,8 +177,7 @@ export async function createClientHandle(
   };
 }
 
-/** @returns {ChannelClient} */
-export function createClient(/** @type {ChannelClientHandle} */ handle) {
+export function createClient(handle: ChannelClientHandle): ChannelClient {
   isClientWorker = true;
 
   return {
@@ -190,53 +187,69 @@ export function createClient(/** @type {ChannelClientHandle} */ handle) {
   };
 }
 
-/** @returns {Batch} */
-function createBatch() {
+function createBatch(): Batch {
   return { items: [], start: promiseWithResolvers(), id: randomId() };
 }
 
-/**
- * @template T
- * @typedef {ReturnType<typeof promiseWithResolvers<T>>} PromiseWithResolvers<T>
- */
+type PromiseWithResolvers<T> = ReturnType<typeof promiseWithResolvers<T>>;
 
-/**
- * @template TIn
- * @template TOut
- * @typedef {{ id: number, data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: PromiseWithResolvers<TOut> }} BatchItem<TIn, TOut>
- */
+type BatchItem<TIn, TOut> = {
+  id: number;
+  data: TIn;
+  transfer: TransferListItem[];
+  controller: PromiseWithResolvers<TOut>;
+};
 
-/** @typedef {{ id: number, items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> }} Batch */
+type Batch = {
+  id: number;
+  items: BatchItem<unknown, any>[];
+  start: PromiseWithResolvers<void>;
+};
 
-/** @typedef {import("node:worker_threads").MessagePort} MessagePort */
+type ChannelEndBase = {
+  messagePort: MessagePort;
+  buffer: SharedArrayBuffer;
+  transferList: TransferListItem[];
+};
+export type ChannelServer = ChannelEndBase;
+export type ChannelClientHandle = ChannelEndBase & { index: number };
+export type ChannelClient = ChannelClientHandle & {
+  batch: Batch;
+  pollerState: PollerState;
+};
 
-/** @typedef {{ messagePort: MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
-/** @typedef {ChannelEndBase} ChannelServer */
-/** @typedef {ChannelEndBase & { index: number } } ChannelClientHandle */
-/** @typedef {ChannelClientHandle & { batch: Batch, pollerState: PollerState }} ChannelClient */
+type InternalMessage = InternalRequestPayload | InternalCreateClientPayload;
+type InternalRequestPayload = {
+  type: "request";
+  clientIndex: number;
+  items: { id: number; data: unknown }[];
+};
+type InternalResponsePayload = {
+  id: number;
+  data: Settled<unknown, ReturnType<typeof serializeThrown>>;
+};
 
-/** @typedef {InternalRequestPayload | InternalCreateClientPayload} InternalMessage */
-/** @typedef {{ type: 'request', clientIndex: number, items: { id: number, data: unknown }[] }} InternalRequestPayload */
-/** @typedef {{ id: number, data: Settled<unknown, ReturnType<typeof serializeThrown>> }} InternalResponsePayload */
+type InternalCreateClientPayload = {
+  type: "createClient";
+  id: number;
+  index: number;
+  messagePort: MessagePort;
+};
+type InternalCreateClientResultPayload = { id: number; ok: boolean };
 
-/** @typedef {{ type: 'createClient', id: number, index: number, messagePort: MessagePort }} InternalCreateClientPayload */
-/** @typedef {{ id: number, ok: boolean }} InternalCreateClientResultPayload */
+type PollerTask<T> = { id: number; controller: PromiseWithResolvers<T> };
 
-/**
- * @template T
- * @typedef {{ id: number, controller: PromiseWithResolvers<T> }} PollerTask<T> */
-/**
- * @template T, E
- * @typedef {{ status: 'fulfilled', value: T } | { status: 'rejected', reason: E }} Settled<T, E>
- * */
+type Settled<T, E> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: E };
 
 const POLLER_YIELD_ITERATIONS = 50; // arbitrary long-ish number (still much cheaper than serializing IO)
 const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
 
 export function sendRequest(
-  /** @type {ChannelClient} */ client,
-  /** @type {any} */ data,
-  /** @type {import("node:worker_threads").TransferListItem[]} */ transfer = []
+  client: ChannelClient,
+  data: any,
+  transfer: TransferListItem[] = []
 ) {
   let timeoutRan = false;
   const timeout = setTimeout(() => {
@@ -288,13 +301,10 @@ export function sendRequest(
   }
 }
 
-function executeBatch(
-  /** @type {ChannelClient} */ client,
-  /** @type {Batch} */ batch
-) {
+function executeBatch(client: ChannelClient, batch: Batch) {
   let batchItemsToRequest = batch.items;
 
-  const rejectBatch = (/** @type {unknown} */ err) => {
+  const rejectBatch = (err: unknown) => {
     rejectBatchItems(batchItemsToRequest, err);
   };
 
@@ -331,12 +341,8 @@ function executeBatch(
   startPolling(client);
 }
 
-function sendBatchItems(
-  /** @type {ChannelClient} */ client,
-  /** @type {Batch['items']} */ batchItems
-) {
-  /** @type {InternalRequestPayload} */
-  const requestPayload = {
+function sendBatchItems(client: ChannelClient, batchItems: Batch["items"]) {
+  const requestPayload: InternalRequestPayload = {
     type: "request",
     clientIndex: client.index,
     items: batchItems.map((item) => ({ id: item.id, data: item.data })),
@@ -346,10 +352,7 @@ function sendBatchItems(
   client.messagePort.postMessage(requestPayload, requestTransferList);
 }
 
-function rejectBatchItems(
-  /** @type {Batch['items']} */ batchItems,
-  /** @type {unknown} */ err
-) {
+function rejectBatchItems(batchItems: Batch["items"], err: unknown) {
   debug?.("client :: rejecting batch", err);
 
   if (batchItems.length === 1) {
@@ -369,12 +372,10 @@ function rejectBatchItems(
   }
 }
 
-/** @returns {Batch['items']} */
 function rejectAndRemoveUncloneableBatchItems(
-  /** @type {Batch['items']} */ batchItems
-) {
-  /** @type {Batch['items']} */
-  const cloneable = [];
+  batchItems: Batch["items"]
+): Batch["items"] {
+  const cloneable: Batch["items"] = [];
   for (let i = 0; i < batchItems.length; i++) {
     const item = batchItems[i];
     try {
@@ -399,12 +400,12 @@ function rejectAndRemoveUncloneableBatchItems(
   return cloneable;
 }
 
-function raceBatchStart(/** @type {Batch} */ batch) {
+function raceBatchStart(batch: Batch) {
   void raceBatchStartImpl(batch);
   return batch.start.promise;
 }
 
-async function raceBatchStartImpl(/** @type {Batch} */ batch) {
+async function raceBatchStartImpl(batch: Batch) {
   // I don't know if there's a way to wait until all pending microtasks are done without leaving the current task.
   // But what we can do is wait for a while, let other microtasks appear/execute, and then close the batch after a period of time.
   const initialBatchLength = batch.items.length;
@@ -427,25 +428,26 @@ async function raceBatchStartImpl(/** @type {Batch} */ batch) {
 // client - blocking response poller
 //===============================================
 
-/** @typedef {ReturnType<createPollerState>} PollerState */
-function createPollerState() {
+type PollerState = {
+  tasks: Map<number, PollerTask<unknown>>;
+  loop: Promise<void> | undefined;
+};
+function createPollerState(): PollerState {
   return {
-    /** @type {Map<number, PollerTask<unknown>>} */
     tasks: new Map(),
-    /** @type {Promise<void> | undefined} */
     loop: undefined,
   };
 }
 
 function addTaskToPoller(
-  /** @type {ChannelClient} */ client,
-  /** @type {PollerTask<unknown>} */ pollerTask
+  client: ChannelClient,
+  pollerTask: PollerTask<unknown>
 ) {
   const { pollerState } = client;
   pollerState.tasks.set(pollerTask.id, pollerTask);
 }
 
-function startPolling(/** @type {ChannelClient} */ client) {
+function startPolling(client: ChannelClient) {
   const { pollerState } = client;
   if (!pollerState.loop) {
     pollerState.loop = (async () => {
@@ -460,7 +462,7 @@ function startPolling(/** @type {ChannelClient} */ client) {
   }
 }
 
-async function runPollLoopUntilDone(/** @type {ChannelClient} */ client) {
+async function runPollLoopUntilDone(client: ChannelClient) {
   const { pollerState } = client;
   while (true) {
     if (!getPendingTaskCount(pollerState)) {
@@ -494,8 +496,7 @@ async function runPollLoopUntilDone(/** @type {ChannelClient} */ client) {
       }
     }
 
-    /** @type {InternalResponsePayload} */
-    const message = received.message;
+    const message = received.message as InternalResponsePayload;
     const taskId = message.id;
     const pollerTask = pollerState.tasks.get(taskId);
     if (!pollerTask) {
@@ -514,7 +515,7 @@ async function runPollLoopUntilDone(/** @type {ChannelClient} */ client) {
   }
 }
 
-function getPendingTaskCount(/** @type {PollerState} */ pollerState) {
+function getPendingTaskCount(pollerState: PollerState) {
   let count = 0;
   for (const pollerTask of pollerState.tasks.values()) {
     if (pollerTask.controller.status === "pending") {
@@ -524,10 +525,7 @@ function getPendingTaskCount(/** @type {PollerState} */ pollerState) {
   return count;
 }
 
-function rejectPendingPollerTasks(
-  /** @type {PollerState} */ pollerState,
-  /** @type {unknown} */ error
-) {
+function rejectPendingPollerTasks(pollerState: PollerState, error: unknown) {
   for (const pollerTask of pollerState.tasks.values()) {
     pollerTask.controller.reject(
       new Error(
@@ -539,10 +537,9 @@ function rejectPendingPollerTasks(
   pollerState.tasks.clear();
 }
 
-/** @template T */
-function settlePromise(
-  /** @type {PromiseWithResolvers<T>} */ controller,
-  /** @type {Settled<T, ReturnType<typeof serializeThrown>>} */ result
+function settlePromise<T>(
+  controller: PromiseWithResolvers<T>,
+  result: Settled<T, ReturnType<typeof serializeThrown>>
 ) {
   if (result.status === "fulfilled") {
     controller.resolve(result.value);
@@ -556,19 +553,16 @@ function settlePromise(
 //===============================================
 
 export function listenForRequests(
-  /** @type {ChannelServer} */ server,
-  /** @type {(data: any) => Promise<any>} */ handler
+  server: ChannelServer,
+  handler: (data: any) => Promise<any>
 ) {
-  /** @type {(() => void)[]} */
-  const cleanups = [];
+  const cleanups: (() => void)[] = [];
 
-  /** @this {MessagePort} */
-  async function handleEvent(/** @type {Event} */ rawEvent) {
-    const event = /** @type {MessageEvent} */ (rawEvent);
+  async function handleEvent(this: MessagePort, rawEvent: Event) {
+    const event = rawEvent as MessageEvent;
     const sourcePort = this;
 
-    /** @type {InternalMessage} */
-    const message = event.data;
+    const message = event.data as InternalMessage;
     if (message.type === "createClient") {
       return handleCreateClient(sourcePort, message);
     } else if (message.type === "request") {
@@ -580,8 +574,8 @@ export function listenForRequests(
 
   // TODO: destroy
   async function handleCreateClient(
-    /** @type {MessagePort} */ sourcePort,
-    /** @type {InternalCreateClientPayload} */ message
+    sourcePort: MessagePort,
+    message: InternalCreateClientPayload
   ) {
     const { id, messagePort } = message;
 
@@ -592,25 +586,23 @@ export function listenForRequests(
       messagePort.removeEventListener("message", handleEvent)
     );
 
-    /** @type {InternalCreateClientResultPayload} */
-    const responsePayload = { id, ok: true };
+    const responsePayload: InternalCreateClientResultPayload = { id, ok: true };
     sourcePort.postMessage(responsePayload);
   }
 
   async function handleRequest(
-    /** @type {MessagePort} */ sourcePort,
-    /** @type {InternalRequestPayload} */ message
+    sourcePort: MessagePort,
+    message: InternalRequestPayload
   ) {
     // request
     const { clientIndex, items: requests } = message;
     debug?.(`server :: request from ${clientIndex}`, requests);
 
-    /** @returns {Promise<Settled<unknown, ReturnType<typeof serializeThrown>>>} */
-    async function safelyRunHandler(/** @type {unknown} */ requestData) {
+    async function safelyRunHandler(
+      requestData: unknown
+    ): Promise<Settled<unknown, ReturnType<typeof serializeThrown>>> {
       // make sure the `any` on the response type doesn't make us bypass type safety
-      const _handler = /** @type {(arg: unknown) => Promise<unknown>} */ (
-        handler
-      );
+      const _handler = handler as (arg: unknown) => Promise<unknown>;
       try {
         return { status: "fulfilled", value: await _handler(requestData) };
       } catch (error) {
@@ -621,8 +613,7 @@ export function listenForRequests(
 
     requests.forEach(async (request) => {
       const result = await safelyRunHandler(request.data);
-      /** @type {InternalResponsePayload} */
-      const responsePayload = {
+      const responsePayload: InternalResponsePayload = {
         id: request.id,
         data: result,
       };
@@ -634,8 +625,7 @@ export function listenForRequests(
         if (isDataCloneError(err)) {
           // We tried to respond with something uncloneable.
           // find out which results caused this and error them.
-          /** @type {InternalResponsePayload} */
-          const fallbackResponsePayload = {
+          const fallbackResponsePayload: InternalResponsePayload = {
             id: request.id,
             data: replaceUncloneableResultWithError(result),
           };
@@ -669,10 +659,9 @@ export function listenForRequests(
   };
 }
 
-/** @returns {InternalResponsePayload['data']} */
 function replaceUncloneableResultWithError(
-  /** @type {InternalResponsePayload['data']} */ result
-) {
+  result: InternalResponsePayload["data"]
+): InternalResponsePayload["data"] {
   try {
     structuredClone(
       result.status === "fulfilled" ? result.value : result.reason
@@ -687,8 +676,7 @@ function replaceUncloneableResultWithError(
 // misc
 //===============================================
 
-/** @returns {err is DOMException} */
-function isDataCloneError(/** @type {unknown} */ err) {
+function isDataCloneError(err: unknown): err is DOMException {
   return !!(
     err &&
     typeof err === "object" &&
@@ -697,7 +685,7 @@ function isDataCloneError(/** @type {unknown} */ err) {
   );
 }
 
-function serializeThrown(/** @type {unknown} */ error) {
+function serializeThrown(error: unknown) {
   if (error && typeof error === "object" && error instanceof Error) {
     return {
       name: error.name,
@@ -710,9 +698,7 @@ function serializeThrown(/** @type {unknown} */ error) {
   return `${error}`;
 }
 
-function deserializeThrown(
-  /** @type {ReturnType<typeof serializeThrown>} */ serialized
-) {
+function deserializeThrown(serialized: ReturnType<typeof serializeThrown>) {
   if (typeof serialized === "object") {
     const error = new Error(serialized.message);
     error.name = serialized.name;
@@ -724,18 +710,13 @@ function deserializeThrown(
   return serialized;
 }
 
-/** @template T */
-function promiseWithResolvers() {
-  /** @type {(value: T) => void} */
-  let resolve = /** @type {any} */ (undefined);
-  /** @type {(error: unknown) => void} */
-  let reject = /** @type {any} */ (undefined);
+function promiseWithResolvers<T>() {
+  let resolve: (value: T) => void = undefined!;
+  let reject: (error: unknown) => void = undefined!;
 
-  /** @type {'pending' | 'fulfilled' | 'rejected'} */
-  let status = "pending";
+  let status: "pending" | "fulfilled" | "rejected" = "pending";
 
-  /** @type {Promise<T>} */
-  const promise = new Promise((_resolve, _reject) => {
+  const promise = new Promise<T>((_resolve, _reject) => {
     resolve = (value) => {
       if (status === "pending") {
         status = "fulfilled";

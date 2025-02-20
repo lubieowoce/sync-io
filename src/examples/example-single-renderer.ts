@@ -1,16 +1,13 @@
-// @ts-check
 import { Worker } from "node:worker_threads";
-import { createChannel, createClientHandle } from "../lib.mjs";
+import { createChannel, createClientHandle } from "../lib.js";
+import type { MainWorkerData } from "./workers/render-worker.js";
+import type { CacheWorkerData } from "./workers/cache-worker.js";
 
-const waitForBoot = async (
-  /** @type {import("node:worker_threads").Worker} */ worker
-) => {
+const waitForBoot = async (worker: Worker) => {
   await new Promise((resolve) => worker.on("online", () => resolve(undefined)));
 };
 
-const waitForEnd = async (
-  /** @type {import("node:worker_threads").Worker} */ worker
-) => {
+const waitForEnd = async (worker: Worker) => {
   await new Promise((resolve) => worker.on("exit", () => resolve(undefined)));
 };
 
@@ -21,10 +18,9 @@ const waitForEnd = async (
   const clientHandle = await createClientHandle(channel);
 
   const mainWorker = new Worker(
-    new URL(import.meta.resolve("./workers/react-worker.mjs")),
+    new URL(import.meta.resolve("./workers/render-worker.js")),
     {
-      /** @type {import("./workers/render-worker.mjs").MainWorkerData} */
-      workerData: { clientHandle, id: 1 },
+      workerData: { clientHandle, id: 1 } as MainWorkerData,
       transferList: [...clientHandle.transferList],
     }
   );
@@ -34,10 +30,9 @@ const waitForEnd = async (
   });
 
   const cacheWorker = new Worker(
-    new URL(import.meta.resolve("./workers/cache-worker.mjs")),
+    new URL(import.meta.resolve("./workers/cache-worker.js")),
     {
-      /** @type {import("./workers/cache-worker.mjs").CacheWorkerData} */
-      workerData: { serverHandle: channel.serverHandle },
+      workerData: { serverHandle: channel.serverHandle } as CacheWorkerData,
       transferList: [...channel.serverHandle.transferList],
     }
   );

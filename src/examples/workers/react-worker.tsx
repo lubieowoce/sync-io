@@ -1,12 +1,12 @@
-// @ts-check
-import { createClient, sendRequest } from "../../lib.mjs";
+import { ChannelClientHandle, createClient } from "../../lib.js";
 import { workerData as workerDataRaw } from "node:worker_threads";
-import { createProxy } from "./cached.mjs";
+import { createProxy } from "./cached.js";
 
 import * as streamConsumers from "node:stream/consumers";
 import * as React from "react";
 // @ts-expect-error
 import * as RSDWStatic from "react-server-dom-webpack/static";
+import type { Readable } from "node:stream";
 
 async function main() {
   const abortController = new AbortController();
@@ -20,7 +20,7 @@ async function main() {
         React.createElement(App),
         {},
         { signal: abortController.signal }
-      );
+      ) as Promise<{ prelude: Readable }>;
     },
     () => {
       console.log("aborting");
@@ -35,10 +35,12 @@ if (!workerDataRaw) {
   throw new Error("Expected to run within a Worker");
 }
 
-/** @typedef {{ clientHandle: import("../../lib.mjs").ChannelClientHandle, id: number }} MainWorkerData */
+export type MainWorkerData = {
+  clientHandle: ChannelClientHandle;
+  id: number;
+};
 
-/** @type {MainWorkerData} */
-const workerData = workerDataRaw;
+const workerData = workerDataRaw as MainWorkerData;
 const { clientHandle, id } = workerData;
 
 console.log(`render-worker ${id} :: hello`);
@@ -53,67 +55,58 @@ const taskyAsyncFunction = async () => {
 };
 
 async function App() {
-  return React.createElement(
-    "main",
-    null,
-    React.createElement(LoremIpsum),
-    React.createElement(Parent),
-    React.createElement(
-      React.Suspense,
-      { fallback: "Loading..." },
-      React.createElement(Dynamic)
-    )
+  return (
+    <main>
+      <LoremIpsum />
+      <Posts />
+      <React.Suspense fallback="Loading...">
+        <Dynamic />
+      </React.Suspense>
+    </main>
   );
 }
 
-async function Parent() {
+async function Posts() {
   await getPost(1);
-  return React.createElement(
-    "section",
-    null,
-    React.createElement(
-      React.Suspense,
-      { fallback: "Loading..." },
-      React.createElement(Dynamic)
-    ),
-    React.createElement(Post, { id: 1 }),
-    React.createElement(Post, { id: 2 }),
-    React.createElement(Post, { id: 3 })
+  return (
+    <section>
+      <React.Suspense fallback="Loading...">
+        <Dynamic />
+      </React.Suspense>
+      <Post id={1} />
+      <Post id={2} />
+      <Post id={3} />
+    </section>
   );
 }
 
 async function Dynamic() {
   await taskyAsyncFunction();
   console.log("Dynamic is finished");
-  return React.createElement("div", null, "Dynamic!");
+  return <div>Dynamic!</div>;
 }
 
-async function Post(/** @type {{ id: number }} */ { id }) {
+async function Post({ id }: { id: number }) {
   const post = await getPost(id);
-  return React.createElement(
-    "div",
-    null,
-    React.createElement("h1", null, post.title),
-    React.createElement("p", null, post.body)
+  return (
+    <div>
+      <h1>{post.title}</h1>
+      <p>{post.body}</p>
+    </div>
   );
 }
 
 async function LoremIpsum() {
   const text = await loremIpsum("");
-  return React.createElement("div", null, text);
+  return <div>{text}</div>;
 }
 
-/**
- * @template R
- * @returns {Promise<R>}
- */
-function prerenderAndAbortInSequentialTasks(
-  /** @type {() => Promise<R>} */ prerender,
-  /** @type {() => void} */ abort
-) {
+function prerenderAndAbortInSequentialTasks<R>(
+  prerender: () => Promise<R>,
+  abort: () => void
+): Promise<R> {
   return new Promise((resolve, reject) => {
-    /** @type {Promise<R>} */
-    let pendingResult;
+    let pendingResult: Promise<R>;
     setImmediate(() => {
       try {
         pendingResult = prerender();

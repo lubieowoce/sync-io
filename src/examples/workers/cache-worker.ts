@@ -1,5 +1,4 @@
-// @ts-check
-import { listenForRequests } from "../../lib.mjs";
+import { listenForRequests } from "../../lib.js";
 import { workerData as workerDataRaw } from "node:worker_threads";
 
 if (!workerDataRaw) {
@@ -10,7 +9,7 @@ console.log("cache-worker :: hello");
 const GET_POST_MOCK = false;
 
 const functions = {
-  async loremIpsum(/** @type {string} */ arg) {
+  async loremIpsum(arg: string) {
     console.log("loremIpsum", arg);
 
     // simulate doing actual IO
@@ -19,7 +18,7 @@ const functions = {
     return "Lorem ipsum, dolor sit amet" + ` (${new Date().toISOString()})`;
   },
 
-  async getPost(/** @type {number} */ postId) {
+  async getPost(postId: number) {
     if (GET_POST_MOCK) {
       await new Promise((resolve) => setTimeout(resolve, 300));
       return {
@@ -46,25 +45,24 @@ const functions = {
   },
 };
 
-/** @typedef {{ functionId: string, args: any[] }} CachedFunctionCall */
+export type CachedFunctionCall = { functionId: string; args: any[] };
 
-/** @typedef {typeof functions} CachedFunctions */
+export type CachedFunctions = typeof functions;
 
-/** @typedef {{ serverHandle: import("../../lib.mjs").ChannelServer }} CacheWorkerData */
+export type CacheWorkerData = {
+  serverHandle: import("../../lib.js").ChannelServer;
+};
 
 /** @type {CacheWorkerData} */
 const workerData = workerDataRaw;
 const { serverHandle } = workerData;
 
-listenForRequests(
-  serverHandle,
-  async (/** @type {CachedFunctionCall} */ request) => {
-    console.log("cache-worker :: got request", request);
-    const { functionId, args } = request;
+listenForRequests(serverHandle, async (request: CachedFunctionCall) => {
+  console.log("cache-worker :: got request", request);
+  const { functionId, args } = request;
 
-    /** @type {(...args: any[]) => unknown} */
-    const func = functions[/** @type {keyof typeof functions} */ (functionId)];
+  const func: (...args: any[]) => unknown =
+    functions[functionId as keyof typeof functions];
 
-    return func(...args);
-  }
-);
+  return func(...args);
+});

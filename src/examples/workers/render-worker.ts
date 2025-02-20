@@ -1,19 +1,20 @@
-// @ts-check
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { createClient, sendRequest } from "../../lib.mjs";
+import { createClient, type ChannelClientHandle } from "../../lib.js";
 import { workerData as workerDataRaw } from "node:worker_threads";
-import { createProxy } from "./cached.mjs";
+import { createProxy } from "./cached.js";
 
 if (!workerDataRaw) {
   throw new Error("Expected to run within a Worker");
 }
 
-/** @typedef {{ clientHandle: import("../../lib.mjs").ChannelClientHandle, id: number }} MainWorkerData */
+export type MainWorkerData = {
+  clientHandle: ChannelClientHandle;
+  id: number;
+};
 
 (async () => {
-  /** @type {MainWorkerData} */
-  const workerData = workerDataRaw;
+  const workerData = workerDataRaw as MainWorkerData;
   const { clientHandle, id } = workerData;
 
   console.log(`render-worker ${id} :: hello`);
@@ -29,13 +30,8 @@ if (!workerDataRaw) {
   }, 0);
 
   await test("interleaved batches", async () => {
-    /** @type {string[]} */
-    const completions = [];
-    /** @template T */
-    const trackCompletion = (
-      /** @type {Promise<T>} */ promise,
-      /** @type {string} */ label
-    ) => {
+    const completions: string[] = [];
+    const trackCompletion = <T>(promise: Promise<T>, label: string) => {
       promise.then(() => completions.push(label));
       return promise;
     };
@@ -153,30 +149,30 @@ if (!workerDataRaw) {
 
 /** @returns {asserts bool is true} */
 function assertThat(
-  /** @type {boolean} */ cond,
-  /** @type {string | Error | undefined} */ message = undefined
+  cond: boolean,
+  message: string | Error | undefined = undefined
 ) {
   return assert.equal(cond, true, message);
 }
 
-function assertIsLoremIpsum(/** @type {any} */ value) {
+function assertIsLoremIpsum(value: any) {
   assert.equal(typeof value, "string");
   assertThat(value.startsWith("Lorem ipsum"));
 }
 
-function assertIsPost(/** @type {any} */ value, /** @type {number} */ id) {
+function assertIsPost(value: any, id: number) {
   assertThat(value && typeof value === "object");
   assert.equal(typeof value.userId, "number");
   assert.equal(value.id, id);
 }
 
-function assertIsFulfilled(/** @type {PromiseSettledResult<any>} */ settled) {
+function assertIsFulfilled(settled: PromiseSettledResult<any>) {
   assertThat(settled && typeof settled === "object");
   assert.equal(settled.status, "fulfilled");
   return settled.value;
 }
 
-function assertIsRejected(/** @type {PromiseSettledResult<any>} */ settled) {
+function assertIsRejected(settled: PromiseSettledResult<any>) {
   assertThat(settled && typeof settled === "object");
   assert.equal(settled.status, "rejected");
   return settled.reason;

@@ -1,8 +1,6 @@
 {
   "compilerOptions": {
-    "allowJs": true,
-    "checkJs": true,
-    "noEmit": true,
+    "outDir": "./dist",
 
     "target": "ESNext",
     "module": "NodeNext",
@@ -10,8 +8,10 @@
 
     "types": ["node"],
     "lib": ["DOM", "ESNext"],
+    "jsx": "react-jsx",
 
     "strict": true,
     "noImplicitAny": true
-  }
+  },
+  "include": ["./src/**/*.ts", "./src/**/*.tsx"]
 }
