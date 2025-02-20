@@ -6,19 +6,21 @@ if (!workerDataRaw) {
 }
 console.log("cache-worker :: hello");
 
-const GET_POST_MOCK = false;
+const GET_POST_MOCK = true;
+
+type Post = { userId: number; id: number; title: string; body: string };
 
 const functions = {
   async loremIpsum(arg: string) {
     console.log("loremIpsum", arg);
 
     // simulate doing actual IO
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, 50));
 
     return "Lorem ipsum, dolor sit amet" + ` (${new Date().toISOString()})`;
   },
 
-  async getPost(postId: number) {
+  async getPost(postId: number): Promise<Post> {
     if (GET_POST_MOCK) {
       await new Promise((resolve) => setTimeout(resolve, 300));
       return {
@@ -34,9 +36,8 @@ const functions = {
       if (!response.ok) {
         throw new Error(`Request not ok: ${response.status}`);
       }
-      /** @type {{userId: number, id: number, title: string, body: string}} */
       const result = await response.json();
-      return result;
+      return result as Post;
     }
   },
 
