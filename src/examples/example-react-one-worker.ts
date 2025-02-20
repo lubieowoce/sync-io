@@ -1,6 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { createChannel, createClientHandle } from "../lib.js";
-import { runCacheServer } from "./workers/cache-functions.js";
+import { runCacheServer } from "./fixtures/cache-functions.js";
 import type { ReactWorkerData } from "./workers/react-worker.js";
 
 const waitForEnd = async (worker: Worker) => {

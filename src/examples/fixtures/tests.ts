@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { type ChannelClientHandle, type ChannelClient } from "../../lib.js";
-import { createProxy } from "./cached.js";
+import { createProxy } from "./cache-function-proxy.js";
 
 export type MainWorkerData = {
   clientHandle: ChannelClientHandle;

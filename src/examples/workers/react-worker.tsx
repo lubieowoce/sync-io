@@ -1,6 +1,6 @@
 import { workerData as workerDataRaw } from "node:worker_threads";
 import { createClient, type ChannelClientHandle } from "../../lib.js";
-import { runTests } from "./test-react.js";
+import { runTests } from "../fixtures/test-react.js";
 
 export type ReactWorkerData = {
   clientHandle: ChannelClientHandle;

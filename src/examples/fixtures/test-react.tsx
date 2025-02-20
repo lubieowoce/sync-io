@@ -1,5 +1,5 @@
 import { type ChannelClient } from "../../lib.js";
-import { createProxy } from "./cached.js";
+import { createProxy } from "./cache-function-proxy.js";
 
 import * as React from "react";
 // @ts-expect-error
