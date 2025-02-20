@@ -179,23 +179,15 @@ export async function createClientHandle(
   };
 }
 
+/** @returns {ChannelClient} */
 export function createClient(/** @type {ChannelClientHandle} */ handle) {
   isClientWorker = true;
 
-  let poller;
-  /** @type {ChannelClient} */
-  const client = {
+  return {
     ...handle,
     batch: createBatch(),
-    get poller() {
-      if (!poller) {
-        poller = createResponsePoller(client);
-      }
-      return poller;
-    },
+    pollerState: createPollerState(),
   };
-
-  return client;
 }
 
 /** @returns {Batch} */
@@ -221,7 +213,7 @@ function createBatch() {
 /** @typedef {{ messagePort: MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
 /** @typedef {ChannelEndBase} ChannelServer */
 /** @typedef {ChannelEndBase & { index: number } } ChannelClientHandle */
-/** @typedef {ChannelClientHandle & { batch: Batch, poller: ResponsePoller }} ChannelClient */
+/** @typedef {ChannelClientHandle & { batch: Batch, pollerState: PollerState }} ChannelClient */
 
 /** @typedef {InternalRequestPayload | InternalCreateClientPayload} InternalMessage */
 /** @typedef {{ type: 'request', clientIndex: number, items: { id: number, data: unknown }[] }} InternalRequestPayload */
@@ -240,118 +232,6 @@ function createBatch() {
 
 const POLLER_YIELD_ITERATIONS = 50; // arbitrary long-ish number (still much cheaper than serializing IO)
 const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
-
-function createResponsePoller(/** @type {ChannelClient} */ client) {
-  /** @type {Map<number, PollerTask<unknown>>} */
-  const pollerTasks = new Map();
-
-  function getPendingTaskCount() {
-    let count = 0;
-    for (const pollerTask of pollerTasks.values()) {
-      if (pollerTask.controller.status === "pending") {
-        count++;
-      }
-    }
-    return count;
-  }
-
-  function rejectPendingTasks(/** @type {unknown} */ error) {
-    for (const pollerTask of pollerTasks.values()) {
-      pollerTask.controller.reject(
-        new Error(
-          "Invariant: An internal error occurred while polling, and this task has to be aborted.",
-          { cause: error }
-        )
-      );
-    }
-    pollerTasks.clear();
-  }
-
-  /** @type {Promise<void> | undefined} */
-  let readLoop;
-  function isPolling() {
-    return !!readLoop;
-  }
-  async function startPolling() {
-    readLoop = startPollingImpl();
-    try {
-      await readLoop;
-    } catch (err) {
-      rejectPendingTasks(err);
-    } finally {
-      readLoop = undefined;
-    }
-  }
-  async function startPollingImpl() {
-    while (true) {
-      if (!getPendingTaskCount()) {
-        debug?.("client :: exiting read loop");
-        readLoop = undefined;
-        return;
-      }
-
-      const received = receiveMessageOnPort(client.messagePort);
-      debug?.(
-        "client :: receiveMessageOnPort",
-        received,
-        received?.message?.id
-      );
-      if (!received) {
-        // if possible, wait for a batch to start to maximize parallelism
-        const wipBatch = client.batch;
-        if (wipBatch.items.length > 0) {
-          debug?.(`client :: waiting for WIP batch to get submitted`);
-          await wipBatch.start.promise;
-          continue;
-        } else {
-          try {
-            DANGEROUSLY_blockAndWaitForServer(
-              client.buffer,
-              client.index,
-              `poller`
-            );
-            continue;
-          } catch (err) {
-            throw new Error("Error while attempting blocking wait", {
-              cause: err,
-            });
-          }
-        }
-      }
-
-      /** @type {InternalResponsePayload} */
-      const message = received.message;
-      const taskId = message.id;
-      const pollerTask = pollerTasks.get(taskId);
-      if (!pollerTask) {
-        throw new Error(
-          `Invariant: poller got message for task that is not waiting (${taskId})`
-        );
-      }
-      pollerTasks.delete(taskId);
-
-      debug?.("client :: yielding to task", pollerTask.id);
-      settlePromise(pollerTask.controller, message.data);
-      // yield and let other code run.
-      for (let i = 0; i < POLLER_YIELD_ITERATIONS; i++) {
-        await null;
-      }
-    }
-  }
-
-  return {
-    add(/** @type {PollerTask<unknown>} */ pollerTask) {
-      pollerTasks.set(pollerTask.id, pollerTask);
-    },
-    startPolling() {
-      if (!isPolling()) {
-        void startPolling();
-      }
-    },
-  };
-}
-
-/** @typedef {ReturnType<typeof createResponsePoller>} ResponsePoller */
 
 export function sendRequest(
   /** @type {ChannelClient} */ client,
@@ -443,9 +323,9 @@ function executeBatch(
   const requestedBatchItems = batchItemsToRequest;
 
   for (const batchItem of requestedBatchItems) {
-    client.poller.add(batchItem);
+    addTaskToPoller(client, batchItem);
   }
-  client.poller.startPolling();
+  startPolling(client);
 }
 
 function sendBatchItems(
@@ -463,18 +343,6 @@ function sendBatchItems(
   client.messagePort.postMessage(requestPayload, requestTransferList);
 }
 
-/** @template T */
-function settlePromise(
-  /** @type {PromiseWithResolvers<T>} */ controller,
-  /** @type {Settled<T, ReturnType<typeof serializeThrown>>} */ result
-) {
-  if (result.status === "fulfilled") {
-    controller.resolve(result.value);
-  } else {
-    controller.reject(deserializeThrown(result.reason));
-  }
-}
-
 function rejectBatchItems(
   /** @type {Batch['items']} */ batchItems,
   /** @type {unknown} */ err
@@ -482,7 +350,7 @@ function rejectBatchItems(
   debug?.("client :: rejecting batch", err);
   for (let i = 0; i < batchItems.length; i++) {
     batchItems[i].controller.reject(
-      new Error("Failed to execute batch", { cause: err })
+      new Error("Failed to execute batched task", { cause: err })
     );
   }
 }
@@ -539,6 +407,134 @@ async function raceBatchStartImpl(/** @type {Batch} */ batch) {
   // if we got here, we waited for `BATCH_MICRO_WAIT_ITERATIONS` and we're still the last item,
   // so we consider the batch closed and can kick off the request.
   batch.start.resolve();
+}
+
+//===============================================
+// client - blocking response poller
+//===============================================
+
+/** @typedef {ReturnType<createPollerState>} PollerState */
+function createPollerState() {
+  return {
+    /** @type {Map<number, PollerTask<unknown>>} */
+    tasks: new Map(),
+    /** @type {Promise<void> | undefined} */
+    loop: undefined,
+  };
+}
+
+function addTaskToPoller(
+  /** @type {ChannelClient} */ client,
+  /** @type {PollerTask<unknown>} */ pollerTask
+) {
+  const { pollerState } = client;
+  pollerState.tasks.set(pollerTask.id, pollerTask);
+}
+
+function startPolling(/** @type {ChannelClient} */ client) {
+  const { pollerState } = client;
+  if (!pollerState.loop) {
+    pollerState.loop = (async () => {
+      try {
+        await runPollLoopUntilDone(client);
+      } catch (err) {
+        rejectPendingPollerTasks(pollerState, err);
+      } finally {
+        pollerState.loop = undefined;
+      }
+    })();
+  }
+}
+
+async function runPollLoopUntilDone(/** @type {ChannelClient} */ client) {
+  const { pollerState } = client;
+  while (true) {
+    if (!getPendingTaskCount(pollerState)) {
+      debug?.("client :: exiting read loop");
+      pollerState.tasks.clear();
+      return;
+    }
+
+    const received = receiveMessageOnPort(client.messagePort);
+    debug?.("client :: receiveMessageOnPort", received, received?.message?.id);
+    if (!received) {
+      // if possible, wait for a batch to start to maximize parallelism
+      const wipBatch = client.batch;
+      if (wipBatch.items.length > 0) {
+        debug?.(`client :: waiting for WIP batch to get submitted`);
+        await wipBatch.start.promise;
+        continue;
+      } else {
+        try {
+          DANGEROUSLY_blockAndWaitForServer(
+            client.buffer,
+            client.index,
+            `poller`
+          );
+          continue;
+        } catch (err) {
+          throw new Error("Invariant: could perform a blocking wait", {
+            cause: err,
+          });
+        }
+      }
+    }
+
+    /** @type {InternalResponsePayload} */
+    const message = received.message;
+    const taskId = message.id;
+    const pollerTask = pollerState.tasks.get(taskId);
+    if (!pollerTask) {
+      throw new Error(
+        `Invariant: poller got message for task that is not waiting (${taskId})`
+      );
+    }
+    pollerState.tasks.delete(taskId);
+
+    debug?.("client :: yielding to task", pollerTask.id);
+    settlePromise(pollerTask.controller, message.data);
+    // yield and let other code run.
+    for (let i = 0; i < POLLER_YIELD_ITERATIONS; i++) {
+      await null;
+    }
+  }
+}
+
+function getPendingTaskCount(/** @type {PollerState} */ pollerState) {
+  let count = 0;
+  for (const pollerTask of pollerState.tasks.values()) {
+    if (pollerTask.controller.status === "pending") {
+      count++;
+    }
+  }
+  return count;
+}
+
+function rejectPendingPollerTasks(
+  /** @type {PollerState} */ pollerState,
+  /** @type {unknown} */ error
+) {
+  for (const pollerTask of pollerState.tasks.values()) {
+    pollerTask.controller.reject(
+      new Error(
+        "Invariant: An internal error occurred while polling, and this task has to be aborted.",
+        { cause: error }
+      )
+    );
+  }
+  pollerState.tasks.clear();
+}
+
+/** @template T */
+function settlePromise(
+  /** @type {PromiseWithResolvers<T>} */ controller,
+  /** @type {Settled<T, ReturnType<typeof serializeThrown>>} */ result
+) {
+  if (result.status === "fulfilled") {
+    controller.resolve(result.value);
+  } else {
+    controller.reject(deserializeThrown(result.reason));
+  }
 }
 
 //===============================================
