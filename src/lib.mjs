@@ -6,7 +6,7 @@ import { receiveMessageOnPort, MessageChannel } from "node:worker_threads";
 let isClientWorker = false;
 const clientWorkerLogs = [];
 
-const CLIENT_LOGS_BUFFER = false;
+const CLIENT_LOGS_BUFFER = true;
 const debug = process.env.DEBUG
   ? (...args) => {
       if (CLIENT_LOGS_BUFFER && isClientWorker) {
@@ -189,7 +189,7 @@ export function createClient(/** @type {ChannelClientHandle} */ handle) {
     batch: createBatch(),
     get poller() {
       if (!poller) {
-        poller = createBatchPoller(comm);
+        poller = createResponsePoller(comm);
       }
       return poller;
     },
@@ -211,7 +211,7 @@ function createBatch() {
 /**
  * @template TIn
  * @template TOut
- * @typedef {{ data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: PromiseWithResolvers<TOut> }} BatchItem<TIn, TOut>
+ * @typedef {{ id: number, data: TIn, transfer: import("node:worker_threads").TransferListItem[], controller: PromiseWithResolvers<TOut> }} BatchItem<TIn, TOut>
  */
 
 /** @typedef {{ id: number, items: BatchItem<unknown, any>[], start: PromiseWithResolvers<void> }} Batch */
@@ -221,15 +221,16 @@ function createBatch() {
 /** @typedef {{ messagePort: MessagePort, buffer: SharedArrayBuffer, transferList: import("node:worker_threads").TransferListItem[]  }} ChannelEndBase */
 /** @typedef {ChannelEndBase} ChannelServer */
 /** @typedef {ChannelEndBase & { index: number } } ChannelClientHandle */
-/** @typedef {ChannelClientHandle & { batch: Batch, poller: BatchPoller }} ChannelClient */
+/** @typedef {ChannelClientHandle & { batch: Batch, poller: ResponsePoller }} ChannelClient */
 
 /** @typedef {InternalRequestPayload | InternalCreateClientPayload} InternalMessage */
-/** @typedef {{ type: 'request', batchId: number, clientIndex: number, data: unknown[] }} InternalRequestPayload */
-/** @typedef {{ batchId: number, index: number, data: Settled<unknown, ReturnType<typeof serializeThrown>> }} InternalResponsePayload */
+/** @typedef {{ type: 'request', clientIndex: number, items: { id: number, data: unknown }[] }} InternalRequestPayload */
+/** @typedef {{ id: number, data: Settled<unknown, ReturnType<typeof serializeThrown>> }} InternalResponsePayload */
 
 /** @typedef {{ type: 'createClient', id: number, index: number, messagePort: MessagePort }} InternalCreateClientPayload */
 /** @typedef {{ id: number, ok: boolean }} InternalCreateClientResultPayload */
 
+/** @typedef {{ id: number, controller: PromiseWithResolvers<unknown> }} PollerTask */
 /**
  * @template T, E
  * @typedef {{ status: 'fulfilled', value: T } | { status: 'rejected', reason: E }} Settled<T, E>
@@ -238,23 +239,30 @@ function createBatch() {
 const POLLER_YIELD_ITERATIONS = 50; // arbitrary long-ish number (still much cheaper than serializing IO)
 const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
 
-function createBatchPoller(/** @type {ChannelClient} */ comm) {
-  /** @type {Map<number, { batch: Batch, controller: PromiseWithResolvers<InternalResponsePayload> }>} */
-  const waiters = new Map();
+function createResponsePoller(/** @type {ChannelClient} */ comm) {
+  /** @type {Map<number, { task: PollerTask, controller: PromiseWithResolvers<InternalResponsePayload> }>} */
+  const pollerTasks = new Map();
 
-  function getBatchStatus(/** @type {Batch} */ batch) {
-    if (batch.start.status === "fulfilled") {
-      // batch started executing
-      return getPendingBatchItemCount(batch.items) > 0 ? "running" : "done";
-    } else {
-      return "not-started";
+  function getPendingTaskCount() {
+    let count = 0;
+    for (const pollerTask of pollerTasks.values()) {
+      if (pollerTask.controller.status === "pending") {
+        count++;
+      }
     }
+    return count;
   }
 
-  function getRunningBatchCount() {
-    return [...waiters.values()].filter(
-      (waiter) => getBatchStatus(waiter.batch) === "running"
-    ).length;
+  function rejectPendingTasks(/** @type {unknown} */ error) {
+    for (const pollerTask of pollerTasks.values()) {
+      pollerTask.controller.reject(
+        new Error(
+          "Invariant: An internal error occurred while polling, and this task has to be aborted.",
+          { cause: error }
+        )
+      );
+    }
+    pollerTasks.clear();
   }
 
   /** @type {Promise<void> | undefined} */
@@ -266,14 +274,15 @@ function createBatchPoller(/** @type {ChannelClient} */ comm) {
     readLoop = startPollingImpl();
     try {
       await readLoop;
+    } catch (err) {
+      rejectPendingTasks(err);
     } finally {
       readLoop = undefined;
     }
   }
   async function startPollingImpl() {
     while (true) {
-      // TODO: this feels like an awkward place to put this
-      if (!getRunningBatchCount()) {
+      if (!getPendingTaskCount()) {
         debug?.("client :: exiting read loop");
         readLoop = undefined;
         return;
@@ -283,7 +292,7 @@ function createBatchPoller(/** @type {ChannelClient} */ comm) {
       debug?.(
         "client :: receiveMessageOnPort",
         received,
-        received?.message?.batchId
+        received?.message?.id
       );
       if (!received) {
         // if possible, wait for a batch to start to maximize parallelism
@@ -301,24 +310,25 @@ function createBatchPoller(/** @type {ChannelClient} */ comm) {
             );
             continue;
           } catch (err) {
-            console.error("client :: error in poller", err);
-            throw err;
+            throw new Error("Error while attempting blocking wait", {
+              cause: err,
+            });
           }
         }
       }
 
       /** @type {InternalResponsePayload} */
       const message = received.message;
-      const waiter = waiters.get(message.batchId);
-      if (!waiter) {
-        // TODO: queue?
+      const taskId = message.id;
+      const pollerTask = pollerTasks.get(taskId);
+      if (!pollerTask) {
         throw new Error(
-          `Invariant :: poller got message for batch that is not waiting (${message.batchId})`
+          `Invariant: poller got message for task that is not waiting (${taskId})`
         );
       }
-      debug?.("client :: yielding to batch", waiter.batch.id);
-      waiter.controller.resolve(message);
-      waiters.delete(message.batchId);
+      debug?.("client :: yielding to task", pollerTask.task.id);
+      pollerTask.controller.resolve(message);
+      pollerTasks.delete(taskId);
 
       // yield and let other code run.
       for (let i = 0; i < POLLER_YIELD_ITERATIONS; i++) {
@@ -328,19 +338,21 @@ function createBatchPoller(/** @type {ChannelClient} */ comm) {
   }
 
   return {
-    waitForMessage(/** @type {Batch} */ batch) {
+    add(/** @type {PollerTask} */ pollerTask) {
       /** @type {PromiseWithResolvers<InternalResponsePayload>} */
       const controller = promiseWithResolvers();
-      waiters.set(batch.id, { batch, controller });
+      pollerTasks.set(pollerTask.id, { task: pollerTask, controller });
+      return controller.promise;
+    },
+    startPolling() {
       if (!isPolling()) {
         void startPolling();
       }
-      return controller.promise;
     },
   };
 }
 
-/** @typedef {ReturnType<typeof createBatchPoller>} BatchPoller */
+/** @typedef {ReturnType<typeof createResponsePoller>} ResponsePoller */
 
 export function sendRequest(
   /** @type {ChannelClient} */ comm,
@@ -351,7 +363,12 @@ export function sendRequest(
 
   const batch = comm.batch;
   const isFirstItem = batch.items.length === 0;
-  batch.items.push({ data, transfer, controller: resultController });
+  batch.items.push({
+    id: randomId(),
+    data,
+    transfer,
+    controller: resultController,
+  });
   debug?.(
     "client :: sendRequest",
     data,
@@ -412,7 +429,7 @@ async function executeBatch(
   };
 
   try {
-    sendBatchItems(comm, batch.id, requestedBatchItems);
+    sendBatchItems(comm, requestedBatchItems);
   } catch (err) {
     if (isDataCloneError(err)) {
       // Some batch items contain uncloneable values.
@@ -427,7 +444,7 @@ async function executeBatch(
       }
       requestedBatchItems = fallbackBatchItems;
       try {
-        sendBatchItems(comm, batch.id, requestedBatchItems);
+        sendBatchItems(comm, requestedBatchItems);
       } catch (err) {
         // We can't do anything other than error the whole batch.
         return rejectBatch(err);
@@ -437,68 +454,54 @@ async function executeBatch(
     }
   }
 
-  while (true) {
-    const message = await comm.poller.waitForMessage(batch);
-    handleResponse(message);
-
-    const pendingCount = getPendingBatchItemCount(requestedBatchItems);
-    if (pendingCount === 0) {
-      break;
-    }
+  for (const batchItem of requestedBatchItems) {
+    void comm.poller.add(batchItem).then(
+      (message) => {
+        if (!didFinishWithinATask()) {
+          return batchItem.controller.reject(
+            new Error(
+              "Invariant: Did not receive a response message in under a task"
+            )
+          );
+        }
+        return settleBatchItem(batchItem, message.data);
+      },
+      (err) => {
+        return batchItem.controller.reject(
+          new Error("Error while polling message", { cause: err })
+        );
+      }
+    );
   }
-
-  function handleResponse(/** @type {InternalResponsePayload} */ message) {
-    debug?.("client :: handleResponse", message);
-    if (message.batchId !== batch.id) {
-      debug?.(
-        `client :: handleResponse[${batch.id}]: got message for different batch (${message.batchId})`
-      );
-      return;
-    }
-    const { index: batchItemIndex, data: batchItemResult } = message;
-
-    if (!didFinishWithinATask()) {
-      return rejectBatch(
-        new Error(
-          "Invariant: Did not receive a response message in under a task"
-        )
-      );
-    }
-
-    if (batchItemResult.status === "fulfilled") {
-      requestedBatchItems[batchItemIndex].controller.resolve(
-        batchItemResult.value
-      );
-    } else {
-      requestedBatchItems[batchItemIndex].controller.reject(
-        deserializeThrown(batchItemResult.reason)
-      );
-    }
-  }
-}
-
-function getPendingBatchItemCount(/** @type {Batch['items']} */ batchItems) {
-  return batchItems.filter((item) => item.controller.status === "pending")
-    .length;
+  comm.poller.startPolling();
 }
 
 function sendBatchItems(
   /** @type {ChannelClient} */ comm,
-  /** @type {number} */ batchId,
   /** @type {Batch['items']} */ batchItems
 ) {
   /** @type {InternalRequestPayload} */
   const requestPayload = {
     type: "request",
-    batchId,
     clientIndex: comm.index,
-    data: batchItems.map((item) => item.data),
+    items: batchItems.map((item) => ({ id: item.id, data: item.data })),
   };
   const requestTransferList = batchItems.flatMap((item) => item.transfer);
   debug?.("client :: sending batch", requestPayload, requestTransferList);
   comm.messagePort.postMessage(requestPayload, requestTransferList);
 }
 
+/** @template T */
+function settleBatchItem(
+  /** @type {BatchItem<any, T>} */ batchItem,
+  /** @type {Settled<T, ReturnType<typeof serializeThrown>>} */ result
+) {
+  if (result.status === "fulfilled") {
+    batchItem.controller.resolve(result.value);
+  } else {
+    batchItem.controller.reject(deserializeThrown(result.reason));
+  }
+}
 
 function rejectBatchItems(
   /** @type {Batch['items']} */ batchItems,
@@ -577,9 +580,9 @@ export function listenForRequests(
   /** @type {(() => void)[]} */
   const cleanups = [];
 
+  /** @this {MessagePort} */
   async function handleEvent(/** @type {Event} */ rawEvent) {
     const event = /** @type {MessageEvent} */ (rawEvent);
-    /** @type {MessagePort} */
     const sourcePort = this;
 
     /** @type {InternalMessage} */
@@ -617,7 +620,7 @@ export function listenForRequests(
     /** @type {InternalRequestPayload} */ message
   ) {
     // request
-    const { batchId, clientIndex, data: requests } = message;
+    const { clientIndex, items: requests } = message;
     debug?.(`server :: request from ${clientIndex}`, requests);
 
     /** @returns {Promise<Settled<unknown, ReturnType<typeof serializeThrown>>>} */
@@ -634,16 +637,15 @@ export function listenForRequests(
       }
     }
 
-    requests.forEach(async (request, index) => {
-      const result = await runRequest(request);
+    requests.forEach(async (request) => {
+      const result = await runRequest(request.data);
       /** @type {InternalResponsePayload} */
       const responsePayload = {
-        batchId,
-        index,
+        id: request.id,
         data: result,
       };
 
-      debug?.(`server :: sending response (${batchId}[${index}])`, result);
+      debug?.(`server :: sending response (${request.id})`, result);
       try {
         sourcePort.postMessage(responsePayload);
       } catch (err) {
@@ -652,8 +654,7 @@ export function listenForRequests(
           // find out which results caused this and error them.
           /** @type {InternalResponsePayload} */
           const fallbackResponsePayload = {
-            batchId,
-            index,
+            id: request.id,
             data: replaceUncloneableResultWithError(result),
           };
           sourcePort.postMessage(fallbackResponsePayload);
@@ -666,7 +667,7 @@ export function listenForRequests(
       try {
         DANGEROUSLY_maybeWakeBlockedClient(comm.buffer, clientIndex);
       } catch (err) {
-        throw new Error(`Error while waking client for ${batchId}[${index}]`, {
+        throw new Error(`Error while waking client for ${request.id}`, {
           cause: err,
         });
       }
