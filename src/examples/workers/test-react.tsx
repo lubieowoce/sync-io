@@ -29,7 +29,7 @@ export async function runTests(client: ChannelClient) {
   }
 
   async function Posts() {
-    await getPost(1);
+    await getPost(10);
     return (
       <section>
         <React.Suspense fallback="Loading...">
