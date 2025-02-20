@@ -230,7 +230,9 @@ function createBatch() {
 /** @typedef {{ type: 'createClient', id: number, index: number, messagePort: MessagePort }} InternalCreateClientPayload */
 /** @typedef {{ id: number, ok: boolean }} InternalCreateClientResultPayload */
 
-/** @typedef {{ id: number, controller: PromiseWithResolvers<unknown> }} PollerTask */
+/**
+ * @template T
+ * @typedef {{ id: number, controller: PromiseWithResolvers<T> }} PollerTask<T> */
 /**
  * @template T, E
  * @typedef {{ status: 'fulfilled', value: T } | { status: 'rejected', reason: E }} Settled<T, E>
@@ -240,7 +242,7 @@ const POLLER_YIELD_ITERATIONS = 50; // arbitrary long-ish number (still much che
 const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
 
 function createResponsePoller(/** @type {ChannelClient} */ comm) {
-  /** @type {Map<number, { task: PollerTask, controller: PromiseWithResolvers<InternalResponsePayload> }>} */
+  /** @type {Map<number, PollerTask<unknown>>} */
   const pollerTasks = new Map();
 
   function getPendingTaskCount() {
@@ -326,10 +328,10 @@ function createResponsePoller(/** @type {ChannelClient} */ comm) {
           `Invariant: poller got message for task that is not waiting (${taskId})`
         );
       }
-      debug?.("client :: yielding to task", pollerTask.task.id);
-      pollerTask.controller.resolve(message);
       pollerTasks.delete(taskId);
 
+      debug?.("client :: yielding to task", pollerTask.id);
+      settlePromise(pollerTask.controller, message.data);
       // yield and let other code run.
       for (let i = 0; i < POLLER_YIELD_ITERATIONS; i++) {
         await null;
@@ -338,11 +340,8 @@ function createResponsePoller(/** @type {ChannelClient} */ comm) {
   }
 
   return {
-    add(/** @type {PollerTask} */ pollerTask) {
-      /** @type {PromiseWithResolvers<InternalResponsePayload>} */
-      const controller = promiseWithResolvers();
-      pollerTasks.set(pollerTask.id, { task: pollerTask, controller });
-      return controller.promise;
+    add(/** @type {PollerTask<unknown>} */ pollerTask) {
+      pollerTasks.set(pollerTask.id, pollerTask);
     },
     startPolling() {
       if (!isPolling()) {
@@ -359,6 +358,11 @@ export function sendRequest(
   /** @type {any} */ data,
   /** @type {import("node:worker_threads").TransferListItem[]} */ transfer = []
 ) {
+  let timeoutRan = false;
+  const timeout = setTimeout(() => {
+    timeoutRan = true;
+  });
+
   const resultController = promiseWithResolvers();
 
   const batch = comm.batch;
@@ -382,7 +386,7 @@ export function sendRequest(
     void batchStartPromise.then(async () => {
       comm.batch = createBatch();
       try {
-        await executeBatch(comm, batch);
+        executeBatch(comm, batch);
       } catch (err) {
         // something very bad happened. reject the whole batch
         rejectBatchItems(batch.items, err);
@@ -390,46 +394,29 @@ export function sendRequest(
     });
   }
 
-  return resultController.promise;
+  try {
+    return resultController.promise;
+  } finally {
+    if (timeoutRan) {
+      throw new Error("Invariant: Did not settle request in under a task");
+    } else {
+      clearTimeout(timeout);
+    }
+  }
 }
 
-async function executeBatch(
+function executeBatch(
   /** @type {ChannelClient} */ comm,
   /** @type {Batch} */ batch
 ) {
-  let requestedBatchItems = batch.items;
+  let batchItemsToRequest = batch.items;
+
   const rejectBatch = (/** @type {unknown} */ err) => {
-    rejectBatchItems(requestedBatchItems, err);
-  };
-
-  /** @type {(() => void)[]} */
-  const cleanups = [];
-  const runCleanups = () => {
-    for (const cleanup of cleanups) {
-      cleanup();
-    }
-    cleanups.length = 0;
-  };
-
-  // schedule cleanups to run when all promises from the batch are settled
-  void Promise.allSettled(
-    batch.items.map((item) => item.controller.promise)
-  ).then(() => {
-    debug?.("client :: batch settled, running cleanups");
-    runCleanups();
-  });
-
-  let timeoutRan = false;
-  const timeout = setTimeout(() => {
-    timeoutRan = true;
-  });
-  cleanups.push(() => clearTimeout(timeout));
-  const didFinishWithinATask = () => {
-    return !timeoutRan;
+    rejectBatchItems(batchItemsToRequest, err);
   };
 
   try {
-    sendBatchItems(comm, requestedBatchItems);
+    sendBatchItems(comm, batchItemsToRequest);
   } catch (err) {
     if (isDataCloneError(err)) {
       // Some batch items contain uncloneable values.
@@ -437,14 +424,14 @@ async function executeBatch(
       // then try sending it again.
       debug?.("client :: unclonable items in batch");
       const fallbackBatchItems =
-        rejectAndRemoveUncloneableBatchItems(requestedBatchItems);
+        rejectAndRemoveUncloneableBatchItems(batchItemsToRequest);
       if (fallbackBatchItems.length === 0) {
         // we already errored all the requests above, nothing left to send.
         return;
       }
-      requestedBatchItems = fallbackBatchItems;
+      batchItemsToRequest = fallbackBatchItems;
       try {
-        sendBatchItems(comm, requestedBatchItems);
+        sendBatchItems(comm, batchItemsToRequest);
       } catch (err) {
         // We can't do anything other than error the whole batch.
         return rejectBatch(err);
@@ -453,25 +440,10 @@ async function executeBatch(
       return rejectBatch(err);
     }
   }
+  const requestedBatchItems = batchItemsToRequest;
 
   for (const batchItem of requestedBatchItems) {
-    void comm.poller.add(batchItem).then(
-      (message) => {
-        if (!didFinishWithinATask()) {
-          return batchItem.controller.reject(
-            new Error(
-              "Invariant: Did not receive a response message in under a task"
-            )
-          );
-        }
-        return settleBatchItem(batchItem, message.data);
-      },
-      (err) => {
-        return batchItem.controller.reject(
-          new Error("Error while polling message", { cause: err })
-        );
-      }
-    );
+    comm.poller.add(batchItem);
   }
   comm.poller.startPolling();
 }
@@ -492,14 +464,14 @@ function sendBatchItems(
 }
 
 /** @template T */
-function settleBatchItem(
-  /** @type {BatchItem<any, T>} */ batchItem,
+function settlePromise(
+  /** @type {PromiseWithResolvers<T>} */ controller,
   /** @type {Settled<T, ReturnType<typeof serializeThrown>>} */ result
 ) {
   if (result.status === "fulfilled") {
-    batchItem.controller.resolve(result.value);
+    controller.resolve(result.value);
   } else {
-    batchItem.controller.reject(deserializeThrown(result.reason));
+    controller.reject(deserializeThrown(result.reason));
   }
 }
 
