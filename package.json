@@ -10,6 +10,7 @@
   "scripts": {
     "build": "tsc",
     "example-react": "NODE_ENV=production node --conditions=react-server dist/examples/example-react.js",
+    "example-react:bun": "NODE_ENV=production bun --conditions=react-server src/examples/example-react.ts",
     "test": "node dist/examples/example-single-renderer.js"
   },
   "author": "",
