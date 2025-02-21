@@ -182,25 +182,20 @@ export function createClient(handle: ChannelClientHandle): ChannelClient {
   };
 }
 
-type PromiseWithResolvers<T> = ReturnType<typeof promiseWithResolvers<T>>;
-
-type WakeableItem<TOut = unknown> = {
-  id: number;
-  controller: PromiseWithResolvers<TOut>;
-};
-
 type ChannelEndBase = {
   messagePort: MessagePort;
   buffer: SharedArrayBuffer;
   transferList: TransferListItem[];
 };
 export type ChannelServer = ChannelEndBase;
+
 export type ChannelClientHandle = ChannelEndBase & { index: number };
 export type ChannelClient = ChannelClientHandle & {
   pollerState: PollerState;
 };
 
 type InternalMessage = InternalRequestPayload | InternalCreateClientPayload;
+
 type InternalRequestPayload = {
   type: "request";
   id: number;
@@ -221,14 +216,6 @@ type InternalCreateClientPayload = {
 };
 type InternalCreateClientResultPayload = { id: number; ok: boolean };
 
-type PollerTask<T> = { id: number; controller: PromiseWithResolvers<T> };
-
-type Settled<T, E> =
-  | { status: "fulfilled"; value: T }
-  | { status: "rejected"; reason: E };
-
-const YIELD_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
-
 export async function sendRequest(
   client: ChannelClient,
   data: unknown,
@@ -239,17 +226,12 @@ export async function sendRequest(
     timeoutRan = true;
   });
 
-  const resultController = promiseWithResolvers();
-
-  const item: WakeableItem = {
-    id: randomId(),
-    controller: resultController,
-  };
+  const item = createWakeableItem();
   postRequestMessage(client, item.id, data, transfer);
   registerWakeableAndBumpYieldDeadline(client, item);
 
   try {
-    return await resultController.promise;
+    return await item.controller.promise;
   } finally {
     if (timeoutRan) {
       throw new Error("Invariant: Did not settle request in under a task");
@@ -276,14 +258,29 @@ function postRequestMessage(
 }
 
 //===============================================
-// client - blocking response poller
+// client - poller
 //===============================================
+
+const YIELD_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
+
+type WakeableItem<TOut = unknown> = {
+  id: number;
+  controller: PromiseWithResolvers<TOut>;
+};
+
+function createWakeableItem<T>(): WakeableItem<T> {
+  return {
+    id: randomId(),
+    controller: promiseWithResolvers<T>(),
+  };
+}
 
 type PollerState = {
   yieldCounter: number | undefined;
-  tasks: Map<number, PollerTask<unknown>>;
+  tasks: Map<number, WakeableItem<unknown>>;
   loop: Promise<void> | undefined;
 };
+
 function createPollerState(): PollerState {
   return {
     yieldCounter: undefined,
@@ -425,6 +422,10 @@ function rejectPendingPollerTasks(pollerState: PollerState, error: unknown) {
   }
   pollerState.tasks.clear();
 }
+
+type Settled<T, E> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: E };
 
 function settlePromise<T>(
   controller: PromiseWithResolvers<T>,
@@ -575,6 +576,8 @@ function deserializeThrown(serialized: ReturnType<typeof serializeThrown>) {
   }
   return serialized;
 }
+
+type PromiseWithResolvers<T> = ReturnType<typeof promiseWithResolvers<T>>;
 
 function promiseWithResolvers<T>() {
   let resolve: (value: T) => void = undefined!;
