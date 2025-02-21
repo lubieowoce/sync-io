@@ -31,10 +31,9 @@ if (CLIENT_LOGS_BUFFER) {
 // atomics-based primitives that let us block
 //===============================================
 
-const ARR_VALUE_STATE = {
-  NO_CLIENT: 0,
-  NOT_DONE: 1,
-  DONE: 2,
+const ClientState = {
+  UNINITIALIZED: 0,
+  INITIALIZED: 1,
 };
 
 function createStateBuffer(maxClients: number) {
@@ -57,11 +56,11 @@ function initializeClientState(buffer: SharedArrayBuffer) {
     throw new Error("Cannot create client, because maxClients is 0");
   }
 
-  const index = asArray.indexOf(ARR_VALUE_STATE.NO_CLIENT);
+  const index = asArray.indexOf(ClientState.UNINITIALIZED);
   if (index === -1) {
     throw new Error(`Cannot create more than ${maxClients} clients`);
   }
-  asArray[index] = ARR_VALUE_STATE.NOT_DONE;
+  asArray[index] = ClientState.INITIALIZED;
   return index;
 }
 
@@ -71,10 +70,10 @@ function DANGEROUSLY_blockAndWaitForServer(
 ) {
   const asArray = new Int32Array(buffer);
   debug?.("client :: calling Atomics.wait");
-  const waitRes = Atomics.wait(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
+  const waitRes = Atomics.wait(asArray, clientIndex, ClientState.INITIALIZED);
   if (waitRes === "not-equal") {
     throw new Error(
-      "Invariant: expected to be in NOT_DONE state when calling Atomics.wait"
+      "Invariant: expected client state to be INITIALIZED when calling Atomics.wait"
     );
   }
   debug?.("client :: " + "=".repeat(80));
@@ -86,10 +85,8 @@ function DANGEROUSLY_maybeWakeBlockedClient(
   clientIndex: number
 ) {
   const asArray = new Int32Array(buffer);
-  // Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.DONE);
   const notifyRes = Atomics.notify(asArray, clientIndex);
   debug?.("server :: notified atomic", notifyRes);
-  // Atomics.store(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
 }
 
 //===============================================
