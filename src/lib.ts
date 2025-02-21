@@ -256,13 +256,13 @@ const YIELD_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper t
 
 type WakeableItem<TOut = unknown> = {
   id: number;
-  controller: PromiseWithResolversAndStatus<TOut>;
+  controller: PromiseWithResolvers<TOut>;
 };
 
 function createWakeableItem<T>(): WakeableItem<T> {
   return {
     id: randomId(),
-    controller: promiseWithResolversAndStatus<T>(),
+    controller: promiseWithResolvers<T>(),
   };
 }
 
@@ -324,14 +324,11 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
   const { schedulerState } = client;
   while (true) {
     if (!hasPendingItems(schedulerState)) {
-      // we have no pending items, so we're not waiting for any more messages.
-      // let go of the microtask queue.
-      // we'll either get another `sendRequest` that'll restart the loop
-      // or we're out of work and the task will finish.
-      debug?.("client :: exiting scheduler loop");
-      return;
+      throw new Error("Invariant: in scheduler loop with no pending items");
     }
 
+    // check if we have got any messages from the server.
+    //
     // TODO: can this be a `createClient` message? then the listener wouldn't receive it,
     // because `receiveMessageOnPort` prevents other message listeners from running,
     // and we'll crash below with "Invariant: scheduler got message for item that is not registered"
@@ -343,7 +340,7 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
         throw new Error("Invariant: no message available and no yield ongoing");
       }
       if (schedulerState.yieldCounter > 0) {
-        // we have pending items, no messages to wake items with,
+        // we have no messages to wake items with,
         // and we're currently letting userspace code run for `yieldCounter` more iterations.
         // (we either just started the scheduler from `sendRequest`,
         // got here after receiving messages and waking all their items).
@@ -353,7 +350,7 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
         schedulerState.yieldCounter--;
         continue;
       } else {
-        // we have pending items, no more messages to wake items with,
+        // we have no messages to wake items with,
         // and we're not yielding to userspace anymore.
         // block and wait for new results to make progress.
         try {
@@ -369,7 +366,7 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
         }
       }
     } else {
-      // we have pending items, and got a message that we can wake an item with.
+      // we got a message and can wake an item.
       const message = received.message as ItemResponseMessage;
       const itemId = message.id;
       const item = schedulerState.wakeableItems.get(itemId);
@@ -380,32 +377,31 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
       }
       schedulerState.wakeableItems.delete(itemId);
 
-      if (item.controller.status !== "pending") {
-        throw new Error(
-          `Invariant: scheduler got message for task that is already ${item.controller.status}`
-        );
-      }
-
       debug?.("client :: waking item", item.id);
       // wake up at the end of `sendRequest` (which will then return to userspace).
       settlePromise(item.controller, message.data);
 
-      // now that we settled the item, we'll want to yield to userspace to let it progress.
-      // but if there's more messages in the queue, we'll wake their items before we start yielding.
-      // this should hopefully maximize concurrency.
+      if (!hasPendingItems(schedulerState)) {
+        // we have no pending items, so we're not waiting for any more messages
+        // and won't need to do any more blocking. let the rest of the microtask queue run free.
+        // we'll either get another `sendRequest` that'll restart the loop,
+        // or we'll run out of microtasks and the (node.js event loop) task will finish.
+        debug?.("client :: exiting scheduler loop");
+        return;
+      }
+
+      // we settled the item, and have more items pending.
+      // we'll want to yield to userspace to let it progress.
       bumpYieldDeadline(schedulerState);
+      // note that if there's more messages in the queue, we'll wake their items before we start yielding.
+      // this should hopefully maximize concurrency.
       continue;
     }
   }
 }
 
 function hasPendingItems(schedulerState: SchedulerState) {
-  for (const item of schedulerState.wakeableItems.values()) {
-    if (item.controller.status === "pending") {
-      return true;
-    }
-  }
-  return false;
+  return schedulerState.wakeableItems.size > 0;
 }
 
 function rejectPendingItems(schedulerState: SchedulerState, error: unknown) {
@@ -425,7 +421,7 @@ type Settled<T, E> =
   | { status: "rejected"; reason: E };
 
 function settlePromise<T>(
-  controller: PromiseWithResolversAndStatus<T>,
+  controller: PromiseWithResolvers<T>,
   result: Settled<T, ReturnType<typeof serializeThrown>>
 ) {
   if (result.status === "fulfilled") {
@@ -597,37 +593,20 @@ function deserializeThrown(serialized: ReturnType<typeof serializeThrown>) {
   return serialized;
 }
 
-type PromiseWithResolversAndStatus<T> = ReturnType<
-  typeof promiseWithResolversAndStatus<T>
->;
+type PromiseWithResolvers<T> = ReturnType<typeof promiseWithResolvers<T>>;
 
-function promiseWithResolversAndStatus<T>() {
+function promiseWithResolvers<T>() {
   let resolve: (value: T) => void = undefined!;
   let reject: (error: unknown) => void = undefined!;
 
-  let status: "pending" | "fulfilled" | "rejected" = "pending";
-
   const promise = new Promise<T>((_resolve, _reject) => {
-    resolve = (value) => {
-      if (status === "pending") {
-        status = "fulfilled";
-      }
-      _resolve(value);
-    };
-    reject = (value) => {
-      if (status === "pending") {
-        status = "rejected";
-      }
-      _reject(value);
-    };
+    resolve = _resolve;
+    reject = _reject;
   });
   return {
     promise,
     resolve,
     reject,
-    get status() {
-      return status;
-    },
   };
 }
 
