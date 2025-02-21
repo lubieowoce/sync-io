@@ -93,6 +93,13 @@ function DANGEROUSLY_maybeWakeBlockedClient(
 // top-level API
 //===============================================
 
+type ChannelEndBase = {
+  messagePort: MessagePort;
+  buffer: SharedArrayBuffer;
+  transferList: TransferListItem[];
+};
+export type ChannelServer = ChannelEndBase;
+
 type Channel = ReturnType<typeof createChannel>;
 
 export function createChannel(maxClients: number = 1) {
@@ -114,6 +121,8 @@ export function createChannel(maxClients: number = 1) {
 //===============================================
 // client - will be blocked
 //===============================================
+
+export type ChannelClientHandle = ChannelEndBase & { index: number };
 
 export async function createClientHandle(
   channel: Channel
@@ -182,6 +191,13 @@ async function tellServerToListenOnMessagePort(
   });
 }
 
+export type ChannelClient = Pick<
+  ChannelClientHandle,
+  "buffer" | "index" | "messagePort"
+> & {
+  schedulerState: SchedulerState;
+};
+
 export function createClient(handle: ChannelClientHandle): ChannelClient {
   isClientWorker = true;
 
@@ -190,41 +206,6 @@ export function createClient(handle: ChannelClientHandle): ChannelClient {
     schedulerState: createSchedulerState(),
   };
 }
-
-type ChannelEndBase = {
-  messagePort: MessagePort;
-  buffer: SharedArrayBuffer;
-  transferList: TransferListItem[];
-};
-export type ChannelServer = ChannelEndBase;
-
-export type ChannelClientHandle = ChannelEndBase & { index: number };
-export type ChannelClient = ChannelClientHandle & {
-  schedulerState: SchedulerState;
-};
-
-type SomeRequestMessage = ItemRequestMessage | CreateClientRequestMessage;
-type SomeResponseMessage = ItemResponseMessage | CreateClientResponseMessage;
-
-type ItemRequestMessage = {
-  type: "request";
-  id: number;
-  clientIndex: number;
-  data: unknown;
-};
-
-type ItemResponseMessage = {
-  id: number;
-  data: Settled<unknown, ReturnType<typeof serializeThrown>>;
-};
-
-type CreateClientRequestMessage = {
-  type: "createClient";
-  id: number;
-  index: number;
-  messagePort: MessagePort;
-};
-type CreateClientResponseMessage = { id: number; ok: boolean };
 
 export async function sendRequest(
   client: ChannelClient,
@@ -457,6 +438,29 @@ function settlePromise<T>(
 //===============================================
 // server - will do work while client is blocked
 //===============================================
+
+type SomeRequestMessage = ItemRequestMessage | CreateClientRequestMessage;
+type SomeResponseMessage = ItemResponseMessage | CreateClientResponseMessage;
+
+type ItemRequestMessage = {
+  type: "request";
+  id: number;
+  clientIndex: number;
+  data: unknown;
+};
+
+type ItemResponseMessage = {
+  id: number;
+  data: Settled<unknown, ReturnType<typeof serializeThrown>>;
+};
+
+type CreateClientRequestMessage = {
+  type: "createClient";
+  id: number;
+  index: number;
+  messagePort: MessagePort;
+};
+type CreateClientResponseMessage = { id: number; ok: boolean };
 
 export function listenForRequests(
   server: ChannelServer,
