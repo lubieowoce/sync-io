@@ -45,7 +45,7 @@ export async function runTests(client: ChannelClient, name: string) {
     assertIsLoremIpsum(result);
   });
 
-  await test("parallel requests - one batch", async () => {
+  await test("parallel requests", async () => {
     const results = await Promise.allSettled([
       getPost(3),
       getPost(4),
@@ -70,7 +70,7 @@ export async function runTests(client: ChannelClient, name: string) {
       );
     });
 
-    await test("unserializable response in batch", async () => {
+    await test("unserializable response in parallel requests", async () => {
       const results = await Promise.allSettled([
         loremIpsum("x"),
         unserializableResponse(),
