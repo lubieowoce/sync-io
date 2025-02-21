@@ -48,7 +48,7 @@ function getMaxNumClients(buffer: SharedArrayBuffer) {
   return buffer.byteLength / Int32Array.BYTES_PER_ELEMENT;
 }
 
-function initializeClientState(buffer: SharedArrayBuffer) {
+function initializeNewClientState(buffer: SharedArrayBuffer) {
   const asArray = new Int32Array(buffer);
   const maxClients = asArray.length;
 
@@ -119,7 +119,7 @@ export async function createClientHandle(
   channel: Channel
 ): Promise<ChannelClientHandle> {
   const buffer = channel.serverHandle.buffer;
-  const index = initializeClientState(buffer);
+  const index = initializeNewClientState(buffer);
   const maxClients = getMaxNumClients(buffer);
 
   let clientPort: MessagePort;
