@@ -256,13 +256,13 @@ const YIELD_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper t
 
 type WakeableItem<TOut = unknown> = {
   id: number;
-  controller: PromiseWithResolvers<TOut>;
+  controller: PromiseWithResolversAndStatus<TOut>;
 };
 
 function createWakeableItem<T>(): WakeableItem<T> {
   return {
     id: randomId(),
-    controller: promiseWithResolvers<T>(),
+    controller: promiseWithResolversAndStatus<T>(),
   };
 }
 
@@ -425,7 +425,7 @@ type Settled<T, E> =
   | { status: "rejected"; reason: E };
 
 function settlePromise<T>(
-  controller: PromiseWithResolvers<T>,
+  controller: PromiseWithResolversAndStatus<T>,
   result: Settled<T, ReturnType<typeof serializeThrown>>
 ) {
   if (result.status === "fulfilled") {
@@ -597,9 +597,11 @@ function deserializeThrown(serialized: ReturnType<typeof serializeThrown>) {
   return serialized;
 }
 
-type PromiseWithResolvers<T> = ReturnType<typeof promiseWithResolvers<T>>;
+type PromiseWithResolversAndStatus<T> = ReturnType<
+  typeof promiseWithResolversAndStatus<T>
+>;
 
-function promiseWithResolvers<T>() {
+function promiseWithResolversAndStatus<T>() {
   let resolve: (value: T) => void = undefined!;
   let reject: (error: unknown) => void = undefined!;
 
