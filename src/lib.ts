@@ -40,7 +40,7 @@ function createStateBuffer(maxClients: number) {
   const buffer = new SharedArrayBuffer(
     Int32Array.BYTES_PER_ELEMENT * maxClients
   );
-  // NOTE: we don't have to initialize the buffer, because NO_CLIENT is 0
+  // NOTE: we don't have to initialize the buffer, because UNINITIALIZED is 0
   return buffer;
 }
 
