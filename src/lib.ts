@@ -93,6 +93,8 @@ function DANGEROUSLY_maybeWakeBlockedClient(
 // top-level API
 //===============================================
 
+type Channel = ReturnType<typeof createChannel>;
+
 export function createChannel(maxClients: number = 1) {
   const buffer = createStateBuffer(maxClients);
 
@@ -114,7 +116,7 @@ export function createChannel(maxClients: number = 1) {
 //===============================================
 
 export async function createClientHandle(
-  channel: ReturnType<typeof createChannel>
+  channel: Channel
 ): Promise<ChannelClientHandle> {
   const buffer = channel.serverHandle.buffer;
   const index = initializeClientState(buffer);
@@ -127,42 +129,12 @@ export async function createClientHandle(
     // without doing the whole `createClient` message dance
     clientPort = channel.serverMessagePort;
   } else {
-    // we need separate ports for each client because each MessagePort can only be transferred once
+    // we need separate ports for each client because each MessagePort can only be transferred once.
     const clientChannel = new MessageChannel();
     clientPort = clientChannel.port1;
+    const serverPort = clientChannel.port2;
 
-    await new Promise((resolve, reject) => {
-      // TODO: prevent deadlocks here (if no server exists yet and this is awaited, we might never get a reply)
-      channel.serverMessagePort.addEventListener(
-        "message",
-        function handle(rawEvent: Event) {
-          const event = rawEvent as MessageEvent;
-          const message = event.data;
-          if (message.id !== requestPayload.id) {
-            return;
-          }
-          channel.serverMessagePort.removeEventListener("message", handle);
-          const { ok } = message as InternalCreateClientResultPayload;
-          if (!ok) {
-            return reject(
-              new Error("Failed to register new client with server")
-            );
-          }
-          return resolve(undefined);
-        }
-      );
-
-      const requestPayload: InternalCreateClientPayload = {
-        type: "createClient",
-        id: randomId(),
-        index,
-        messagePort: clientChannel.port2,
-      };
-      debug?.("client :: sending createClient message", requestPayload);
-      channel.serverMessagePort.postMessage(requestPayload, [
-        requestPayload.messagePort,
-      ]);
-    });
+    await tellServerToListenOnMessagePort(channel, index, serverPort);
   }
 
   return {
@@ -171,6 +143,43 @@ export async function createClientHandle(
     index,
     transferList: [clientPort],
   };
+}
+
+async function tellServerToListenOnMessagePort(
+  channel: Channel,
+  clientIndex: number,
+  messagePort: MessagePort
+) {
+  await new Promise((resolve, reject) => {
+    // TODO: prevent deadlocks here (if no server exists yet and this is awaited, we might never get a reply)
+    channel.serverMessagePort.addEventListener(
+      "message",
+      function handle(rawEvent: Event) {
+        const event = rawEvent as MessageEvent;
+        const message = event.data as SomeResponseMessage;
+        if (message.id !== requestPayload.id) {
+          return;
+        }
+        channel.serverMessagePort.removeEventListener("message", handle);
+        const { ok } = message as CreateClientResponseMessage;
+        if (!ok) {
+          return reject(new Error("Failed to register new client with server"));
+        }
+        return resolve(undefined);
+      }
+    );
+
+    const requestPayload: CreateClientRequestMessage = {
+      type: "createClient",
+      id: randomId(),
+      index: clientIndex,
+      messagePort: messagePort,
+    };
+    debug?.("client :: sending createClient message", requestPayload);
+    channel.serverMessagePort.postMessage(requestPayload, [
+      requestPayload.messagePort,
+    ]);
+  });
 }
 
 export function createClient(handle: ChannelClientHandle): ChannelClient {
@@ -194,27 +203,28 @@ export type ChannelClient = ChannelClientHandle & {
   pollerState: PollerState;
 };
 
-type InternalMessage = InternalRequestPayload | InternalCreateClientPayload;
+type SomeRequestMessage = ItemRequestMessage | CreateClientRequestMessage;
+type SomeResponseMessage = ItemResponseMessage | CreateClientResponseMessage;
 
-type InternalRequestPayload = {
+type ItemRequestMessage = {
   type: "request";
   id: number;
   clientIndex: number;
   data: unknown;
 };
 
-type InternalResponsePayload = {
+type ItemResponseMessage = {
   id: number;
   data: Settled<unknown, ReturnType<typeof serializeThrown>>;
 };
 
-type InternalCreateClientPayload = {
+type CreateClientRequestMessage = {
   type: "createClient";
   id: number;
   index: number;
   messagePort: MessagePort;
 };
-type InternalCreateClientResultPayload = { id: number; ok: boolean };
+type CreateClientResponseMessage = { id: number; ok: boolean };
 
 export async function sendRequest(
   client: ChannelClient,
@@ -247,7 +257,7 @@ function postRequestMessage(
   data: unknown,
   transfer: TransferListItem[] | undefined
 ) {
-  const requestPayload: InternalRequestPayload = {
+  const requestPayload: ItemRequestMessage = {
     type: "request",
     clientIndex: client.index,
     id,
@@ -337,6 +347,9 @@ async function runPollLoopUntilDone(client: ChannelClient) {
       return;
     }
 
+    // TODO: can this be a `createClient` message? then the listener wouldn't receive it,
+    // because `receiveMessageOnPort` prevents other message listeners from running,
+    // and we'll crash below with "Invariant: poller got message for task that is not registered"
     const received = receiveMessageOnPort(client.messagePort);
     debug?.("client :: receiveMessageOnPort", received, received?.message?.id);
 
@@ -372,7 +385,7 @@ async function runPollLoopUntilDone(client: ChannelClient) {
       }
     } else {
       // we have pending tasks, and got a message that we can wake a task with.
-      const message = received.message as InternalResponsePayload;
+      const message = received.message as ItemResponseMessage;
       const taskId = message.id;
       const pollerTask = pollerState.tasks.get(taskId);
       if (!pollerTask) {
@@ -452,7 +465,7 @@ export function listenForRequests(
     const event = rawEvent as MessageEvent;
     const sourcePort = this;
 
-    const message = event.data as InternalMessage;
+    const message = event.data as SomeRequestMessage;
     if (message.type === "createClient") {
       return handleCreateClient(sourcePort, message);
     } else if (message.type === "request") {
@@ -465,7 +478,7 @@ export function listenForRequests(
   // TODO: destroy
   async function handleCreateClient(
     sourcePort: MessagePort,
-    message: InternalCreateClientPayload
+    message: CreateClientRequestMessage
   ) {
     const { id, messagePort } = message;
 
@@ -476,7 +489,7 @@ export function listenForRequests(
       messagePort.removeEventListener("message", handleEvent)
     );
 
-    const responsePayload: InternalCreateClientResultPayload = {
+    const responsePayload: CreateClientResponseMessage = {
       id,
       ok: true,
     };
@@ -485,7 +498,7 @@ export function listenForRequests(
 
   async function handleRequest(
     sourcePort: MessagePort,
-    request: InternalRequestPayload
+    request: ItemRequestMessage
   ) {
     debug?.(`server :: request from ${request.clientIndex}`, request.data);
 
@@ -503,7 +516,7 @@ export function listenForRequests(
     }
 
     const result = await safelyRunHandler(request.data);
-    const responsePayload: InternalResponsePayload = {
+    const responsePayload: ItemResponseMessage = {
       id: request.id,
       data: result,
     };
@@ -514,7 +527,7 @@ export function listenForRequests(
     } catch (err) {
       try {
         // Try sending an error result instead -- maybe the returned value was uncloneable.
-        const fallbackResponsePayload: InternalResponsePayload = {
+        const fallbackResponsePayload: ItemResponseMessage = {
           id: request.id,
           data: { status: "rejected", reason: serializeThrown(err) },
         };
