@@ -212,16 +212,25 @@ export async function sendRequest(
   data: unknown,
   transfer: TransferListItem[] = []
 ) {
+  const item = createWakeableItem();
+
+  // note that this can throw (e.g. because of uncloneable values or incorrect transferList)
+  // for this reason, we want to attempt sending the message *before* registering the task --
+  // otherwise we might end up with an orphaned task that'd never get awaited OR resolved.
+  postRequestMessage(client, item.id, data, transfer);
+
+  // we'll start the scheduler loop (if not running already),
+  // let the microtask queue run for a bit more (so that other parallel calls to `sendRequest` can be kicked off)
+  // and then eventually blockingly wait for responses.
+  registerItemAndBumpYieldDeadline(client, item);
+
   let timeoutRan = false;
   const timeout = setTimeout(() => {
     timeoutRan = true;
   });
 
-  const item = createWakeableItem();
-  postRequestMessage(client, item.id, data, transfer);
-  registerItemAndBumpYieldDeadline(client, item);
-
   try {
+    // when the the response to the message arrives, the scheduler will resume us.
     return await item.controller.promise;
   } finally {
     if (timeoutRan) {
