@@ -67,11 +67,10 @@ function initializeClientState(buffer: SharedArrayBuffer) {
 
 function DANGEROUSLY_blockAndWaitForServer(
   buffer: SharedArrayBuffer,
-  clientIndex: number,
-  source: string | undefined = undefined
+  clientIndex: number
 ) {
   const asArray = new Int32Array(buffer);
-  debug?.("client :: calling Atomics.wait", source);
+  debug?.("client :: calling Atomics.wait");
   const waitRes = Atomics.wait(asArray, clientIndex, ARR_VALUE_STATE.NOT_DONE);
   if (waitRes === "not-equal") {
     throw new Error(
@@ -79,7 +78,7 @@ function DANGEROUSLY_blockAndWaitForServer(
     );
   }
   debug?.("client :: " + "=".repeat(80));
-  debug?.("client :: Atomics.wait returned", waitRes, source);
+  debug?.("client :: Atomics.wait returned", waitRes);
 }
 
 function DANGEROUSLY_maybeWakeBlockedClient(
@@ -182,28 +181,15 @@ export function createClient(handle: ChannelClientHandle): ChannelClient {
 
   return {
     ...handle,
-    batch: createBatch(),
     pollerState: createPollerState(),
   };
 }
 
-function createBatch(): Batch {
-  return { items: [], start: promiseWithResolvers(), id: randomId() };
-}
-
 type PromiseWithResolvers<T> = ReturnType<typeof promiseWithResolvers<T>>;
 
-type BatchItem<TIn, TOut> = {
+type WakeableItem<TOut = unknown> = {
   id: number;
-  data: TIn;
-  transfer: TransferListItem[];
   controller: PromiseWithResolvers<TOut>;
-};
-
-type Batch = {
-  id: number;
-  items: BatchItem<unknown, any>[];
-  start: PromiseWithResolvers<void>;
 };
 
 type ChannelEndBase = {
@@ -214,7 +200,6 @@ type ChannelEndBase = {
 export type ChannelServer = ChannelEndBase;
 export type ChannelClientHandle = ChannelEndBase & { index: number };
 export type ChannelClient = ChannelClientHandle & {
-  batch: Batch;
   pollerState: PollerState;
 };
 
@@ -245,12 +230,11 @@ type Settled<T, E> =
   | { status: "fulfilled"; value: T }
   | { status: "rejected"; reason: E };
 
-const POLLER_YIELD_ITERATIONS = 50; // arbitrary long-ish number (still much cheaper than serializing IO)
-const BATCH_MICRO_WAIT_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
+const YIELD_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
 
-export function sendRequest(
+export async function sendRequest(
   client: ChannelClient,
-  data: any,
+  data: unknown,
   transfer: TransferListItem[] = []
 ) {
   let timeoutRan = false;
@@ -260,40 +244,15 @@ export function sendRequest(
 
   const resultController = promiseWithResolvers();
 
-  const batch = client.batch;
-  const isFirstItem = batch.items.length === 0;
-  batch.items.push({
+  const item: WakeableItem = {
     id: randomId(),
-    data,
-    transfer,
     controller: resultController,
-  });
-  debug?.(
-    "client :: sendRequest",
-    data,
-    `(current batch: ${batch.items.length} items)`
-  );
-
-  const batchStartPromise = raceBatchStart(batch);
-
-  // we want this to only get kicked off once, so only do it for the first item.
-  if (isFirstItem) {
-    void batchStartPromise.then(async () => {
-      client.batch = createBatch();
-      try {
-        executeBatch(client, batch);
-      } catch (err) {
-        // something very bad happened. reject the whole batch
-        rejectBatchItems(
-          batch.items,
-          new Error("Internal error: executeBatch crashed", { cause: err })
-        );
-      }
-    });
-  }
+  };
+  postRequestMessage(client, item.id, data, transfer);
+  registerWakeableAndBumpYieldDeadline(client, item);
 
   try {
-    return resultController.promise;
+    return await resultController.promise;
   } finally {
     if (timeoutRan) {
       throw new Error("Invariant: Did not settle request in under a task");
@@ -303,71 +262,20 @@ export function sendRequest(
   }
 }
 
-function executeBatch(client: ChannelClient, batch: Batch) {
-  for (const item of batch.items) {
-    try {
-      sendItem(client, item);
-      addTaskToPoller(client, item);
-    } catch (err) {
-      item.controller.reject(err);
-    }
-  }
-  startPolling(client);
-}
-
-function sendItem(client: ChannelClient, item: BatchItem<any, any>) {
+function postRequestMessage(
+  client: ChannelClient,
+  id: number,
+  data: unknown,
+  transfer: TransferListItem[] | undefined
+) {
   const requestPayload: InternalRequestPayload = {
     type: "request",
     clientIndex: client.index,
-    id: item.id,
-    data: item.data,
+    id,
+    data,
   };
-  debug?.("client :: sending", requestPayload, item.transfer);
-  client.messagePort.postMessage(requestPayload, item.transfer);
-}
-
-function rejectBatchItems(batchItems: Batch["items"], err: unknown) {
-  debug?.("client :: rejecting batch", err);
-
-  if (batchItems.length === 1) {
-    // if there's only one task, we can error it directly.
-    if (batchItems[0].controller.status === "pending") {
-      batchItems[0].controller.reject(err);
-    }
-    return;
-  }
-
-  for (let i = 0; i < batchItems.length; i++) {
-    if (batchItems[i].controller.status === "pending") {
-      batchItems[i].controller.reject(
-        new Error("Failed to execute batched task", { cause: err })
-      );
-    }
-  }
-}
-
-function raceBatchStart(batch: Batch) {
-  void raceBatchStartImpl(batch);
-  return batch.start.promise;
-}
-
-async function raceBatchStartImpl(batch: Batch) {
-  // I don't know if there's a way to wait until all pending microtasks are done without leaving the current task.
-  // But what we can do is wait for a while, let other microtasks appear/execute, and then close the batch after a period of time.
-  const initialBatchLength = batch.items.length;
-  for (let i = 0; i < BATCH_MICRO_WAIT_ITERATIONS; i++) {
-    await null;
-    if (batch.items.length !== initialBatchLength) {
-      // the batch length changed, so we're no longer the last item --
-      // the new last item is responsible for resolving the start promise,
-      // and has its own `raceBatchStart` going, so we've got nothing to do here.
-      // (and it's pointless for us to create more microtasks here)
-      return;
-    }
-  }
-  // if we got here, we waited for `BATCH_MICRO_WAIT_ITERATIONS` and we're still the last item,
-  // so we consider the batch closed and can kick off the request.
-  batch.start.resolve();
+  debug?.("client :: sending", requestPayload, transfer);
+  client.messagePort.postMessage(requestPayload, transfer);
 }
 
 //===============================================
@@ -375,22 +283,35 @@ async function raceBatchStartImpl(batch: Batch) {
 //===============================================
 
 type PollerState = {
+  yieldCounter: number | undefined;
   tasks: Map<number, PollerTask<unknown>>;
   loop: Promise<void> | undefined;
 };
 function createPollerState(): PollerState {
   return {
+    yieldCounter: undefined,
     tasks: new Map(),
     loop: undefined,
   };
 }
 
-function addTaskToPoller(
+function registerWakeableAndBumpYieldDeadline(
   client: ChannelClient,
-  pollerTask: PollerTask<unknown>
+  item: WakeableItem
 ) {
   const { pollerState } = client;
-  pollerState.tasks.set(pollerTask.id, pollerTask);
+  // we're either going to be starting the poller
+  // or the poller yielded to us.
+  // in either case we want to let other code run for a bit
+  // to maximize IO concurrency before we block,
+  // so reset the counter.
+  bumpYieldDeadline(pollerState);
+  pollerState.tasks.set(item.id, item);
+  startPolling(client);
+}
+
+function bumpYieldDeadline(pollerState: PollerState) {
+  pollerState.yieldCounter = YIELD_ITERATIONS;
 }
 
 function startPolling(client: ChannelClient) {
@@ -412,27 +333,42 @@ async function runPollLoopUntilDone(client: ChannelClient) {
   const { pollerState } = client;
   while (true) {
     if (!getPendingTaskCount(pollerState)) {
-      debug?.("client :: exiting read loop");
+      // we have no pending tasks, so we're not waiting for any more messages.
+      // let go of the microtask queue.
+      // we'll either get another `sendRequest` that'll restart the loop
+      // or we're out of work and the task will finish.
+      debug?.("client :: exiting poller loop");
       pollerState.tasks.clear();
+      pollerState.yieldCounter = undefined;
       return;
     }
 
     const received = receiveMessageOnPort(client.messagePort);
     debug?.("client :: receiveMessageOnPort", received, received?.message?.id);
+
     if (!received) {
-      // if possible, wait for a batch to start to maximize parallelism
-      const wipBatch = client.batch;
-      if (wipBatch.items.length > 0) {
-        debug?.(`client :: waiting for WIP batch to get submitted`);
-        await wipBatch.start.promise;
+      if (pollerState.yieldCounter === undefined) {
+        throw new Error("Invariant: no message available and no yield ongoing");
+      }
+      if (pollerState.yieldCounter > 0) {
+        // we have pending tasks, no messages to wake tasks with,
+        // and we're currently letting userspace code run for `yieldCounter` more iterations.
+        // (we either just started polling and came here from `sendRequest`,
+        // or after receiving messages and waking all the tasks).
+        //
+        // yield.
+        await null;
+        pollerState.yieldCounter--;
         continue;
       } else {
+        // we have pending tasks, no more messages to wake tasks with,
+        // and we're not yielding to userspace anymore.
+        // block and wait for new results to make progress.
         try {
-          DANGEROUSLY_blockAndWaitForServer(
-            client.buffer,
-            client.index,
-            `poller`
-          );
+          DANGEROUSLY_blockAndWaitForServer(client.buffer, client.index);
+          // we got woken up, so there should messages ready to read
+          // on the next iteration.
+          // we'll read those, wake their tasks, and then start yielding.
           continue;
         } catch (err) {
           throw new Error("Invariant: could not perform a blocking wait", {
@@ -440,23 +376,33 @@ async function runPollLoopUntilDone(client: ChannelClient) {
           });
         }
       }
-    }
+    } else {
+      // we have pending tasks, and got a message that we can wake a task with.
+      const message = received.message as InternalResponsePayload;
+      const taskId = message.id;
+      const pollerTask = pollerState.tasks.get(taskId);
+      if (!pollerTask) {
+        throw new Error(
+          `Invariant: poller got message for task that is not registered (${taskId})`
+        );
+      }
+      pollerState.tasks.delete(taskId);
 
-    const message = received.message as InternalResponsePayload;
-    const taskId = message.id;
-    const pollerTask = pollerState.tasks.get(taskId);
-    if (!pollerTask) {
-      throw new Error(
-        `Invariant: poller got message for task that is not waiting (${taskId})`
-      );
-    }
-    pollerState.tasks.delete(taskId);
+      if (pollerTask.controller.status !== "pending") {
+        throw new Error(
+          `Invariant: poller got message for task that is already ${pollerTask.controller.status}`
+        );
+      }
 
-    debug?.("client :: yielding to task", pollerTask.id);
-    settlePromise(pollerTask.controller, message.data);
-    // yield and let other code run.
-    for (let i = 0; i < POLLER_YIELD_ITERATIONS; i++) {
-      await null;
+      debug?.("client :: waking task", pollerTask.id);
+      // wake up at the end of `sendRequest` (which will then return to userspace).
+      settlePromise(pollerTask.controller, message.data);
+
+      // now that we settled the task, we'll want to yield to userspace to let it progress.
+      // but if there's more messages in the queue, we'll wake their tasks before we start yielding.
+      // this should hopefully maximize concurrency.
+      bumpYieldDeadline(pollerState);
+      continue;
     }
   }
 }
