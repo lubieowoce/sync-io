@@ -187,7 +187,7 @@ export function createClient(handle: ChannelClientHandle): ChannelClient {
 
   return {
     ...handle,
-    pollerState: createPollerState(),
+    schedulerState: createSchedulerState(),
   };
 }
 
@@ -200,7 +200,7 @@ export type ChannelServer = ChannelEndBase;
 
 export type ChannelClientHandle = ChannelEndBase & { index: number };
 export type ChannelClient = ChannelClientHandle & {
-  pollerState: PollerState;
+  schedulerState: SchedulerState;
 };
 
 type SomeRequestMessage = ItemRequestMessage | CreateClientRequestMessage;
@@ -238,7 +238,7 @@ export async function sendRequest(
 
   const item = createWakeableItem();
   postRequestMessage(client, item.id, data, transfer);
-  registerWakeableAndBumpYieldDeadline(client, item);
+  registerItemAndBumpYieldDeadline(client, item);
 
   try {
     return await item.controller.promise;
@@ -268,7 +268,7 @@ function postRequestMessage(
 }
 
 //===============================================
-// client - poller
+// client - scheduler
 //===============================================
 
 const YIELD_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
@@ -285,97 +285,101 @@ function createWakeableItem<T>(): WakeableItem<T> {
   };
 }
 
-type PollerState = {
+type SchedulerState = {
   yieldCounter: number | undefined;
-  tasks: Map<number, WakeableItem<unknown>>;
-  loop: Promise<void> | undefined;
+  wakeableItems: Map<number, WakeableItem<unknown>>;
+  running: Promise<void> | undefined;
 };
 
-function createPollerState(): PollerState {
+function createSchedulerState(): SchedulerState {
   return {
     yieldCounter: undefined,
-    tasks: new Map(),
-    loop: undefined,
+    wakeableItems: new Map(),
+    running: undefined,
   };
 }
 
-function registerWakeableAndBumpYieldDeadline(
+function resetSchedulerState(schedulerState: SchedulerState) {
+  schedulerState.wakeableItems.clear();
+  schedulerState.yieldCounter = undefined;
+}
+
+function registerItemAndBumpYieldDeadline(
   client: ChannelClient,
   item: WakeableItem
 ) {
-  const { pollerState } = client;
-  // we're either going to be starting the poller
-  // or the poller yielded to us.
+  const { schedulerState } = client;
+  // we're either going to be starting the scheduler
+  // or the scheduler yielded to us.
   // in either case we want to let other code run for a bit
   // to maximize IO concurrency before we block,
   // so reset the counter.
-  bumpYieldDeadline(pollerState);
-  pollerState.tasks.set(item.id, item);
-  startPolling(client);
+  bumpYieldDeadline(schedulerState);
+  schedulerState.wakeableItems.set(item.id, item);
+  startScheduler(client);
 }
 
-function bumpYieldDeadline(pollerState: PollerState) {
-  pollerState.yieldCounter = YIELD_ITERATIONS;
+function bumpYieldDeadline(schedulerState: SchedulerState) {
+  schedulerState.yieldCounter = YIELD_ITERATIONS;
 }
 
-function startPolling(client: ChannelClient) {
-  const { pollerState } = client;
-  if (!pollerState.loop) {
-    pollerState.loop = (async () => {
+function startScheduler(client: ChannelClient) {
+  const { schedulerState } = client;
+  if (!schedulerState.running) {
+    schedulerState.running = (async () => {
       try {
-        await runPollLoopUntilDone(client);
+        await runSchedulerLoopUntilDone(client);
       } catch (err) {
-        rejectPendingPollerTasks(pollerState, err);
+        rejectPendingItems(schedulerState, err);
       } finally {
-        pollerState.loop = undefined;
+        resetSchedulerState(schedulerState);
+        schedulerState.running = undefined;
       }
     })();
   }
 }
 
-async function runPollLoopUntilDone(client: ChannelClient) {
-  const { pollerState } = client;
+async function runSchedulerLoopUntilDone(client: ChannelClient) {
+  const { schedulerState } = client;
   while (true) {
-    if (!getPendingTaskCount(pollerState)) {
-      // we have no pending tasks, so we're not waiting for any more messages.
+    if (!hasPendingItems(schedulerState)) {
+      // we have no pending items, so we're not waiting for any more messages.
       // let go of the microtask queue.
       // we'll either get another `sendRequest` that'll restart the loop
       // or we're out of work and the task will finish.
-      debug?.("client :: exiting poller loop");
-      pollerState.tasks.clear();
-      pollerState.yieldCounter = undefined;
+      debug?.("client :: exiting scheduler loop");
       return;
     }
 
     // TODO: can this be a `createClient` message? then the listener wouldn't receive it,
     // because `receiveMessageOnPort` prevents other message listeners from running,
-    // and we'll crash below with "Invariant: poller got message for task that is not registered"
+    // and we'll crash below with "Invariant: scheduler got message for item that is not registered"
     const received = receiveMessageOnPort(client.messagePort);
     debug?.("client :: receiveMessageOnPort", received, received?.message?.id);
 
     if (!received) {
-      if (pollerState.yieldCounter === undefined) {
+      if (schedulerState.yieldCounter === undefined) {
         throw new Error("Invariant: no message available and no yield ongoing");
       }
-      if (pollerState.yieldCounter > 0) {
-        // we have pending tasks, no messages to wake tasks with,
+      if (schedulerState.yieldCounter > 0) {
+        // we have pending items, no messages to wake items with,
         // and we're currently letting userspace code run for `yieldCounter` more iterations.
-        // (we either just started polling and came here from `sendRequest`,
-        // or after receiving messages and waking all the tasks).
+        // (we either just started the scheduler from `sendRequest`,
+        // got here after receiving messages and waking all their items).
         //
         // yield.
         await null;
-        pollerState.yieldCounter--;
+        schedulerState.yieldCounter--;
         continue;
       } else {
-        // we have pending tasks, no more messages to wake tasks with,
+        // we have pending items, no more messages to wake items with,
         // and we're not yielding to userspace anymore.
         // block and wait for new results to make progress.
         try {
           DANGEROUSLY_blockAndWaitForServer(client.buffer, client.index);
           // we got woken up, so there should messages ready to read
           // on the next iteration.
-          // we'll read those, wake their tasks, and then start yielding.
+          // we'll read those, wake their items, and then start yielding.
           continue;
         } catch (err) {
           throw new Error("Invariant: could not perform a blocking wait", {
@@ -384,56 +388,55 @@ async function runPollLoopUntilDone(client: ChannelClient) {
         }
       }
     } else {
-      // we have pending tasks, and got a message that we can wake a task with.
+      // we have pending items, and got a message that we can wake an item with.
       const message = received.message as ItemResponseMessage;
-      const taskId = message.id;
-      const pollerTask = pollerState.tasks.get(taskId);
-      if (!pollerTask) {
+      const itemId = message.id;
+      const item = schedulerState.wakeableItems.get(itemId);
+      if (!item) {
         throw new Error(
-          `Invariant: poller got message for task that is not registered (${taskId})`
+          `Invariant: scheduler got message for item that is not registered (${itemId})`
         );
       }
-      pollerState.tasks.delete(taskId);
+      schedulerState.wakeableItems.delete(itemId);
 
-      if (pollerTask.controller.status !== "pending") {
+      if (item.controller.status !== "pending") {
         throw new Error(
-          `Invariant: poller got message for task that is already ${pollerTask.controller.status}`
+          `Invariant: scheduler got message for task that is already ${item.controller.status}`
         );
       }
 
-      debug?.("client :: waking task", pollerTask.id);
+      debug?.("client :: waking item", item.id);
       // wake up at the end of `sendRequest` (which will then return to userspace).
-      settlePromise(pollerTask.controller, message.data);
+      settlePromise(item.controller, message.data);
 
-      // now that we settled the task, we'll want to yield to userspace to let it progress.
-      // but if there's more messages in the queue, we'll wake their tasks before we start yielding.
+      // now that we settled the item, we'll want to yield to userspace to let it progress.
+      // but if there's more messages in the queue, we'll wake their items before we start yielding.
       // this should hopefully maximize concurrency.
-      bumpYieldDeadline(pollerState);
+      bumpYieldDeadline(schedulerState);
       continue;
     }
   }
 }
 
-function getPendingTaskCount(pollerState: PollerState) {
-  let count = 0;
-  for (const pollerTask of pollerState.tasks.values()) {
-    if (pollerTask.controller.status === "pending") {
-      count++;
+function hasPendingItems(schedulerState: SchedulerState) {
+  for (const item of schedulerState.wakeableItems.values()) {
+    if (item.controller.status === "pending") {
+      return true;
     }
   }
-  return count;
+  return false;
 }
 
-function rejectPendingPollerTasks(pollerState: PollerState, error: unknown) {
-  for (const pollerTask of pollerState.tasks.values()) {
-    pollerTask.controller.reject(
+function rejectPendingItems(schedulerState: SchedulerState, error: unknown) {
+  for (const item of schedulerState.wakeableItems.values()) {
+    item.controller.reject(
       new Error(
-        "Invariant: An internal error occurred while polling, and this task has to be aborted.",
+        "Invariant: An internal error occurred in the scheduler, and this item has to be aborted.",
         { cause: error }
       )
     );
   }
-  pollerState.tasks.clear();
+  schedulerState.wakeableItems.clear();
 }
 
 type Settled<T, E> =
