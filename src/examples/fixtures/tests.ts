@@ -16,10 +16,6 @@ export async function runTests(client: ChannelClient, name: string) {
   const unserializableResponse = createProxy(client, "unserializableResponse");
   const noop = createProxy(client, "noop");
 
-  setTimeout(() => {
-    console.log(`${name} :: hello from timeout!`);
-  }, 0);
-
   await test("interleaved batches", async () => {
     const completions: string[] = [];
     const trackCompletion = <T>(promise: Promise<T>, label: string) => {
@@ -27,13 +23,15 @@ export async function runTests(client: ChannelClient, name: string) {
       return promise;
     };
 
-    await Promise.all([
-      (async () => {
-        await trackCompletion(loremIpsum("1"), `loremIpsum("1")`);
-        await trackCompletion(loremIpsum("2"), `loremIpsum("2")`);
-      })(),
-      trackCompletion(getPost(1), `getPost(1)`),
-    ]);
+    await expectToRunInLessThanATask(() =>
+      Promise.all([
+        (async () => {
+          await trackCompletion(loremIpsum("1"), `loremIpsum("1")`);
+          await trackCompletion(loremIpsum("2"), `loremIpsum("2")`);
+        })(),
+        trackCompletion(getPost(1), `getPost(1)`),
+      ])
+    );
 
     assert.deepStrictEqual(completions, [
       `loremIpsum("1")`,
@@ -43,16 +41,14 @@ export async function runTests(client: ChannelClient, name: string) {
   });
 
   await test("single request", async () => {
-    const result = await loremIpsum("boop");
+    const result = await expectToRunInLessThanATask(() => loremIpsum("boop"));
     assertIsLoremIpsum(result);
   });
 
   await test("parallel requests", async () => {
-    const results = await Promise.allSettled([
-      getPost(3),
-      getPost(4),
-      unserializableResponse(),
-    ]);
+    const results = await expectToRunInLessThanATask(() =>
+      Promise.allSettled([getPost(3), getPost(4), unserializableResponse()])
+    );
     const value0 = assertIsFulfilled(results[0]);
     assertIsPost(value0, 3);
 
@@ -66,17 +62,16 @@ export async function runTests(client: ChannelClient, name: string) {
   await describe("invalid arguments/results", async () => {
     await test("unserializable response", async () => {
       await assert.rejects(
-        () => unserializableResponse(),
+        expectToRunInLessThanATask(() => unserializableResponse()),
         /DataCloneError: #<Promise> could not be cloned\./,
         undefined
       );
     });
 
     await test("unserializable response in parallel requests", async () => {
-      const results = await Promise.allSettled([
-        loremIpsum("x"),
-        unserializableResponse(),
-      ]);
+      const results = await expectToRunInLessThanATask(() =>
+        Promise.allSettled([loremIpsum("x"), unserializableResponse()])
+      );
       const value0 = assertIsFulfilled(results[0]);
       assertIsLoremIpsum(value0);
 
@@ -86,17 +81,19 @@ export async function runTests(client: ChannelClient, name: string) {
 
     await test("uncloneable argument", async () => {
       await assert.rejects(
-        () => noop({ promise: Promise.resolve() }),
+        expectToRunInLessThanATask(() => noop({ promise: Promise.resolve() })),
         /#<Promise> could not be cloned\./,
         undefined
       );
     });
 
     await test("uncloneable argument in batch", async () => {
-      const results = await Promise.allSettled([
-        loremIpsum("x"),
-        noop({ promise: Promise.resolve() }),
-      ]);
+      const results = await expectToRunInLessThanATask(() =>
+        Promise.allSettled([
+          loremIpsum("x"),
+          noop({ promise: Promise.resolve() }),
+        ])
+      );
 
       const value0 = assertIsFulfilled(results[0]);
       assertIsLoremIpsum(value0);
@@ -107,17 +104,16 @@ export async function runTests(client: ChannelClient, name: string) {
 
     await test("untransferable argument", async () => {
       await assert.rejects(
-        () => noop(new MessageChannel().port1),
+        expectToRunInLessThanATask(() => noop(new MessageChannel().port1)),
         /Object that needs transfer was found in message but not listed in transferList/,
         undefined
       );
     });
 
     await test("untransferable argument in batch", async () => {
-      const results = await Promise.allSettled([
-        loremIpsum("x"),
-        noop(new MessageChannel().port1),
-      ]);
+      const results = await expectToRunInLessThanATask(() =>
+        Promise.allSettled([loremIpsum("x"), noop(new MessageChannel().port1)])
+      );
 
       // it's a bit unfortunate that we reject the first promise too,
       // but it's hard to do better and it's a hard error anyway
@@ -149,20 +145,22 @@ export async function runTests(client: ChannelClient, name: string) {
         return promise;
       };
 
-      await Promise.all([
-        // wait for the microtask queue to be exhausted
-        drainCurrentMicrotaskQueue().then(() =>
-          Promise.all([
-            trackCompletion(loremIpsum("1", 20), `loremIpsum("1")`),
-            trackCompletion(loremIpsum("2", 20), `loremIpsum("2")`),
-            // wait for the microtask queue to be exhausted AGAIN
-            drainCurrentMicrotaskQueue().then(() =>
-              // this has the shortest delay, so assuming all three calls run in parallel, it should finish first
-              trackCompletion(loremIpsum("1", 10), `loremIpsum("3")`)
-            ),
-          ])
-        ),
-      ]);
+      await expectToRunInLessThanATask(() =>
+        Promise.all([
+          // wait for the microtask queue to be exhausted
+          drainCurrentMicrotaskQueue().then(() =>
+            Promise.all([
+              trackCompletion(loremIpsum("1", 20), `loremIpsum("1")`),
+              trackCompletion(loremIpsum("2", 20), `loremIpsum("2")`),
+              // wait for the microtask queue to be exhausted AGAIN
+              drainCurrentMicrotaskQueue().then(() =>
+                // this has the shortest delay, so assuming all three calls run in parallel, it should finish first
+                trackCompletion(loremIpsum("1", 10), `loremIpsum("3")`)
+              ),
+            ])
+          ),
+        ])
+      );
       assert.deepStrictEqual(completions, [
         `loremIpsum("3")`,
         `loremIpsum("1")`,
@@ -250,20 +248,22 @@ export async function runTests(client: ChannelClient, name: string) {
         getMultipleItems(args, 10)
       );
 
-      await Promise.all([
-        // these two will run immediately
-        trackCompletion(loremIpsum("1", 20), `loremIpsum("1")`),
-        // the dataloader will execute a request for these two after the current microtask queue
-        trackCompletion(dataLoader.get("1"), `dataLoader.get("1")`),
-        trackCompletion(dataLoader.get("2"), `dataLoader.get("2")`),
-        // this will also execute after the current microtask queue,
-        // after the dataloader executed a request for the two calls above.
-        // this will start a new batch, so the dataloader will wait
-        // for the microtask queue to be exhausted *a second time* before executing the request.
-        drainCurrentMicrotaskQueue().then(() =>
-          trackCompletion(dataLoader.get("3"), `dataLoader.get("3")`)
-        ),
-      ]);
+      await expectToRunInLessThanATask(() =>
+        Promise.all([
+          // these two will run immediately
+          trackCompletion(loremIpsum("1", 20), `loremIpsum("1")`),
+          // the dataloader will execute a request for these two after the current microtask queue
+          trackCompletion(dataLoader.get("1"), `dataLoader.get("1")`),
+          trackCompletion(dataLoader.get("2"), `dataLoader.get("2")`),
+          // this will also execute after the current microtask queue,
+          // after the dataloader executed a request for the two calls above.
+          // this will start a new batch, so the dataloader will wait
+          // for the microtask queue to be exhausted *a second time* before executing the request.
+          drainCurrentMicrotaskQueue().then(() =>
+            trackCompletion(dataLoader.get("3"), `dataLoader.get("3")`)
+          ),
+        ])
+      );
 
       assert.deepStrictEqual(completions, [
         `dataLoader.get("1")`,
@@ -273,6 +273,19 @@ export async function runTests(client: ChannelClient, name: string) {
       ]);
     });
   });
+}
+
+async function expectToRunInLessThanATask<T>(body: () => T): Promise<T> {
+  let immediateRan = false;
+  const immediate = setImmediate(() => {
+    immediateRan = true;
+  });
+  try {
+    return await body();
+  } finally {
+    assert.notEqual(immediateRan, true, "Did not finish in less than a task");
+    clearImmediate(immediate);
+  }
 }
 
 function assertThat(
