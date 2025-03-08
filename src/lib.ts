@@ -261,7 +261,9 @@ function postRequestMessage(
 // client - scheduler
 //===============================================
 
-const YIELD_ITERATIONS = 100; // arbitrary long-ish number (still much cheaper than serializing IO)
+// this number is a bit arbitrary. once should generally be enough,
+// but we do it multiple times to avoid blocking too early and thus maximize parallelism.
+const MICROTASK_QUEUE_DRAIN_ITERATIONS = 5;
 
 type WakeableItem<TOut = unknown> = {
   id: number;
@@ -310,7 +312,20 @@ function registerItemAndBumpYieldDeadline(
 }
 
 function bumpYieldDeadline(schedulerState: SchedulerState) {
-  schedulerState.yieldCounter = YIELD_ITERATIONS;
+  schedulerState.yieldCounter = MICROTASK_QUEUE_DRAIN_ITERATIONS;
+}
+
+function drainCurrentMicrotaskQueue() {
+  // if we're in a microtask, then `process.nextTick` will run
+  // when the microtask queue is exhausted, but before anything else.
+  // at that point we can schedule more microtasks, and they'll still run before anything else,
+  // so this process is repeatable without advancing to the next task.
+  // this lets the scheduler loop call and await this functon `MICROTASK_QUEUE_DRAIN_ITERATIONS` times before blocking.
+  return new Promise<void>((resolve) => {
+    queueMicrotask(() => {
+      process.nextTick(resolve);
+    });
+  });
 }
 
 function startScheduler(client: ChannelClient) {
@@ -342,7 +357,6 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
     // because `receiveMessageOnPort` prevents other message listeners from running,
     // and we'll crash below with "Invariant: scheduler got message for item that is not registered"
     const received = receiveMessageOnPort(client.messagePort);
-    debug?.("client :: receiveMessageOnPort", received, received?.message?.id);
 
     if (!received) {
       if (schedulerState.yieldCounter === undefined) {
@@ -354,8 +368,12 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
         // (we either just started the scheduler from `sendRequest`,
         // got here after receiving messages and waking all their items).
         //
-        // yield.
-        await null;
+        // the longest timestep we can take while staying within the same task
+        // is to wait until the end of the current microtask queue (see `afterCurrentMicrotaskQueue` for details).
+        // but note that userspace code can do the same trick (e.g. to implement a dataloader pattern),
+        // so we'll still want to do this multiple times to avoid blocking too early.
+        debug?.("client :: waiting for the end of the current microtask queue");
+        await drainCurrentMicrotaskQueue();
         schedulerState.yieldCounter--;
         continue;
       } else {
@@ -363,6 +381,7 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
         // and we're not yielding to userspace anymore.
         // block and wait for new results to make progress.
         try {
+          debug?.("client :: blocking");
           DANGEROUSLY_blockAndWaitForServer(client.buffer, client.index);
           // we got woken up, so there should messages ready to read
           // on the next iteration.
@@ -375,6 +394,11 @@ async function runSchedulerLoopUntilDone(client: ChannelClient) {
         }
       }
     } else {
+      debug?.(
+        "client :: got message from `receiveMessageOnPort`",
+        received.message.id,
+        received.message
+      );
       // we got a message and can wake an item.
       const message = received.message as ItemResponseMessage;
       const itemId = message.id;
