@@ -16,30 +16,6 @@ export async function runTests(client: ChannelClient, name: string) {
   const unserializableResponse = createProxy(client, "unserializableResponse");
   const noop = createProxy(client, "noop");
 
-  await test("interleaved batches", async () => {
-    const completions: string[] = [];
-    const trackCompletion = <T>(promise: Promise<T>, label: string) => {
-      promise.then(() => completions.push(label));
-      return promise;
-    };
-
-    await expectToRunInLessThanATask(() =>
-      Promise.all([
-        (async () => {
-          await trackCompletion(loremIpsum("1"), `loremIpsum("1")`);
-          await trackCompletion(loremIpsum("2"), `loremIpsum("2")`);
-        })(),
-        trackCompletion(getPost(1), `getPost(1)`),
-      ])
-    );
-
-    assert.deepStrictEqual(completions, [
-      `loremIpsum("1")`,
-      `loremIpsum("2")`,
-      `getPost(1)`,
-    ]);
-  });
-
   await test("single request", async () => {
     const result = await expectToRunInLessThanATask(() => loremIpsum("boop"));
     assertIsLoremIpsum(result);
@@ -57,6 +33,31 @@ export async function runTests(client: ChannelClient, name: string) {
 
     const reason2 = assertIsRejected(results[2]);
     assert.equal(reason2.message, "#<Promise> could not be cloned.");
+  });
+
+  await test("interleaved parallelizable requests", async () => {
+    const completions: string[] = [];
+    const trackCompletion = <T>(promise: Promise<T>, label: string) => {
+      promise.then(() => completions.push(label));
+      return promise;
+    };
+
+    await expectToRunInLessThanATask(() =>
+      Promise.all([
+        (async () => {
+          // if we're parallelizing things correctly, both of the loremIpsum calls should finish before getPost does.
+          await trackCompletion(loremIpsum("1", 10), `loremIpsum("1")`);
+          await trackCompletion(loremIpsum("2", 10), `loremIpsum("2")`);
+        })(),
+        trackCompletion(getPost(1, 50), `getPost(1)`),
+      ])
+    );
+
+    assert.deepStrictEqual(completions, [
+      `loremIpsum("1")`,
+      `loremIpsum("2")`,
+      `getPost(1)`,
+    ]);
   });
 
   await describe("invalid arguments/results", async () => {

@@ -24,9 +24,9 @@ const functions = {
     return ids.map((id) => `<result for ${id}> (${now})`);
   },
 
-  async getPost(postId: number): Promise<Post> {
+  async getPost(postId: number, delay = 300): Promise<Post> {
     if (GET_POST_MOCK) {
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      await new Promise((resolve) => setTimeout(resolve, delay));
       return {
         userId: 1,
         id: postId,
