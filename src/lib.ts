@@ -224,19 +224,19 @@ export async function sendRequest(
   // and then eventually blockingly wait for responses.
   registerItemAndBumpYieldDeadline(client, item);
 
-  let timeoutRan = false;
-  const timeout = setTimeout(() => {
-    timeoutRan = true;
+  let immediateRan = false;
+  const immediate = setImmediate(() => {
+    immediateRan = true;
   });
 
   try {
     // when the the response to the message arrives, the scheduler will resume us.
     return await item.controller.promise;
   } finally {
-    if (timeoutRan) {
+    if (immediateRan) {
       throw new Error("Invariant: Did not settle request in under a task");
     } else {
-      clearTimeout(timeout);
+      clearImmediate(immediate);
     }
   }
 }
